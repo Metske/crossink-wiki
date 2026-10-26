@@ -1,0 +1,28 @@
+#pragma once
+
+#include <I18n.h>
+
+#include <algorithm>
+#include <cstddef>
+#include <cstdint>
+#include <cstdio>
+
+// The reader menu and the frontlight panel show the same compact progress line.
+// A zero page count means that the current format has no chapter page count.
+inline void formatReaderBookProgress(char* buffer, size_t size, uint32_t chapterPage, uint32_t chapterPageCount,
+                                     bool chapterPageCountEstimated, int bookPercent) {
+  if (size == 0) return;
+  const int percent = std::clamp(bookPercent, 0, 100);
+  if (chapterPageCount > 0) {
+    if (chapterPageCountEstimated) {
+      std::snprintf(buffer, size, "%s%lu / ??%s%s%d%%", tr(STR_CHAPTER_PREFIX),
+                    static_cast<unsigned long>(chapterPage), tr(STR_PAGES_SEPARATOR), tr(STR_BOOK_PREFIX), percent);
+    } else {
+      std::snprintf(buffer, size, "%s%lu/%lu%s%s%d%%", tr(STR_CHAPTER_PREFIX),
+                    static_cast<unsigned long>(std::min(chapterPage, chapterPageCount)),
+                    static_cast<unsigned long>(chapterPageCount), tr(STR_PAGES_SEPARATOR), tr(STR_BOOK_PREFIX), percent);
+    }
+  } else {
+    std::snprintf(buffer, size, "%s%d%%", tr(STR_BOOK_PREFIX), percent);
+  }
+}
