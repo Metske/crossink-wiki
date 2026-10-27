@@ -690,7 +690,7 @@ void WikiTableViewerActivity::rebuildWindowsAndLayout() {
                 r0ColSpan = rawRow.empty() ? 1 : rawRow[0].colSpan;
                 r0AllHdr = thisRowAllHdr && !rawRow.empty();
             } else if (rIdx == 1) {
-                r1AllHdr = thisRowAllHdr && r0AllHdr;
+                r1AllHdr = thisRowAllHdr && r0AllHdr && (rawRow.size() > 1);
             }
             if (prevHadRowSpan && rowRawSpanSum < minColsAfterRowSpan) {
                 minColsAfterRowSpan = rowRawSpanSum;
@@ -730,7 +730,7 @@ void WikiTableViewerActivity::rebuildWindowsAndLayout() {
         }
         maxLogicalCols_ = std::clamp<size_t>(maxLogicalCols_, 1, MAX_LOGICAL_COLS);
         alreadyExpanded_ = hasAnyRowSpan && (minColsAfterRowSpan >= maxLogicalCols_);
-        if (r0RawSize == 1 && maxLogicalCols_ > 1 && r0ColSpan <= 1) {
+        if (r0RawSize == 1 && maxLogicalCols_ > 1) {
             r0AllHdr = false;
             r1AllHdr = false;
         }
@@ -783,9 +783,31 @@ void WikiTableViewerActivity::rebuildWindowsAndLayout() {
             if (line.rfind("===END===", 0) == 0) return false;
             if (!parseRawRowLine(line, rawRow, true)) return true;
 
+            if (globalRowIdx < static_cast<size_t>(stickyTopRowCount_) && rawRow.size() == 1 && numCols > 1) {
+                bool anyActiveSpan = false;
+                for (size_t k = 0; k < numCols; ++k) {
+                    if (activeCols[k].remainingRows > 0) {
+                        anyActiveSpan = true;
+                        break;
+                    }
+                }
+                if (!anyActiveSpan) {
+                    if (globalRowIdx == 0) {
+                        hasStickyTopRow_ = false;
+                        stickyTopRowCount_ = 0;
+                        stickyHeaderRows_.clear();
+                    } else {
+                        stickyTopRowCount_ = static_cast<int>(globalRowIdx);
+                    }
+                }
+            }
+
             if (globalRowIdx >= static_cast<size_t>(stickyTopRowCount_)) {
                 size_t dataRowIdx = globalRowIdx - static_cast<size_t>(stickyTopRowCount_);
-                if ((dataRowIdx % rowsPerWindow) == 0) {
+                size_t remRows = (static_cast<size_t>(totalLogicalRows_) > globalRowIdx)
+                                     ? (static_cast<size_t>(totalLogicalRows_) - globalRowIdx)
+                                     : 0;
+                if (((dataRowIdx % rowsPerWindow) == 0 && remRows > 2) || windows_.empty()) {
                     RowWindowInfo wi;
                     wi.streamByteOffset = lineStart;
                     wi.streamByteLength = lineEnd - lineStart;
@@ -812,13 +834,7 @@ void WikiTableViewerActivity::rebuildWindowsAndLayout() {
             expandRawRowIntoGrid(rawRow, static_cast<int>(globalRowIdx), activeCols, expandedRow);
 
             if (globalRowIdx < static_cast<size_t>(stickyTopRowCount_)) {
-                if (!expandedRow.empty() && expandedRow[0].isFullRowBanner && numCols > 1) {
-                    hasStickyTopRow_ = false;
-                    stickyTopRowCount_ = 0;
-                    stickyHeaderRows_.clear();
-                } else {
-                    stickyHeaderRows_.push_back(expandedRow);
-                }
+                stickyHeaderRows_.push_back(expandedRow);
             }
 
             if (!expandedRow.empty() && !expandedRow[0].isFullRowBanner) {

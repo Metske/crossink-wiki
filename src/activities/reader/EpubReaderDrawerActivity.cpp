@@ -2074,7 +2074,10 @@ void EpubReaderDrawerActivity::selectEnumOption(const int index) {
           value == 1 ? EpubReaderMenuAction::SEARCH_WIKIPEDIA_AUTHOR
                      : (value == 2 ? EpubReaderMenuAction::SEARCH_WIKIPEDIA_BOOK_TITLE
                                    : EpubReaderMenuAction::SEARCH_WIKIPEDIA_WORD);
-      closeAndReturn(false, action, !mappedInput.hasTouchHardware());
+      state.pane = enumOptionReturnPane;
+      state.paneTopIndex = 0;
+      state.selectedIndex = 0;
+      closeAndReturn(false, action, false);
       return;
     }
     case RowId::DictionaryFontFamily:
