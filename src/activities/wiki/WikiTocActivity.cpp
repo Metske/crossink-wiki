@@ -1,6 +1,7 @@
 #include "WikiTocActivity.h"
 #include "WikiReaderActivity.h"
 #include "activities/ActivityManager.h"
+#include "components/TouchHeaderBackButton.h"
 #include "components/UITheme.h"
 #include "WikiDecompressor.h"
 #include "WikiHtmlToPlainText.h"
@@ -29,6 +30,7 @@ WikiTocActivity::WikiTocActivity(GfxRenderer& renderer, MappedInputManager& mapp
 }
 
 void WikiTocActivity::onEnter() {
+  buttonSelectionVisible_ = !mappedInput.hasTouchHardware();
   UiListActivity::onEnter();
 }
 
@@ -42,8 +44,10 @@ const char* WikiTocActivity::headerTitle() const {
 
 void WikiTocActivity::buildScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
-  screen.setContentMarginFromScreen(freeink::ui::Insets{static_cast<int16_t>(metrics.topPadding + metrics.headerHeight + 12), 0,
-                                                static_cast<int16_t>(WikiGUI::WIKI_HINTS_HEIGHT), 0});
+  const int headerH = TouchHeaderBackButton::height(metrics, mappedInput);
+  screen.setContentMarginFromScreen(freeink::ui::Insets{
+      static_cast<int16_t>(metrics.topPadding + headerH + (mappedInput.hasTouchHardware() ? 4 : 12)), 0,
+      static_cast<int16_t>(WikiGUI::hintsHeight(mappedInput)), 0});
   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
 
   freeink::ui::ListProps props;
@@ -52,7 +56,20 @@ void WikiTocActivity::buildScreen(UiScreen& screen) {
   props.action = ACTION_ROW;
   props.inputMask = freeink::ui::InputTouch;
   syncListViewport(screen, props);
+  if (!buttonSelectionVisible_) {
+    props.selectedIndex = -1;
+  }
   screen.list(props);
+}
+
+void WikiTocActivity::navigateButtons() {
+  if (mappedInput.wasPressed(MappedInputManager::Button::Up) ||
+      mappedInput.wasPressed(MappedInputManager::Button::Down) ||
+      mappedInput.wasPressed(MappedInputManager::Button::Left) ||
+      mappedInput.wasPressed(MappedInputManager::Button::Right)) {
+    buttonSelectionVisible_ = true;
+  }
+  UiListActivity::navigateButtons();
 }
 
 void WikiTocActivity::activateIndex(int index) {
@@ -68,6 +85,25 @@ void WikiTocActivity::onBackButton() {
   result.isCancelled = true;
   setResult(std::move(result));
   finish();
+}
+
+bool WikiTocActivity::handleCustomInput() {
+  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
+    onBackButton();
+    return true;
+  }
+  return false;
+}
+
+void WikiTocActivity::drawChrome() {
+  const char* title = headerTitle();
+  if (!title) return;
+  const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
+  if (mappedInput.hasTouchHardware()) {
+    TouchHeaderBackButton::draw(renderer, header, title, false);
+  } else {
+    GUI.drawHeader(renderer, header, title);
+  }
 }
 
 void WikiTocActivity::drawFooter() {

@@ -84,5 +84,10 @@ class WikiReaderActivity final : public Activity {
   void onNextPage();
   void onPrevPage();
   void onBack();
+  void openArticleMenuPopup();
+  void selectPrevLink();
+  void selectNextLink();
+  bool followSelectedLink();
+  void closeToSearch();
   void followLink(const std::string& href);
 };

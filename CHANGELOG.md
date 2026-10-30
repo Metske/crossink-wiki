@@ -1,3 +1,15 @@
+## [Unreleased]
+
+### Added
+
+- Offline Wikipedia touch UI on ESP32-S3 touch devices (X4 Pro, Sticky): native `<` header back navigation, header `[...]` action menus (including `Switch archive` and `Search Wikipedia`), direct inline link and table-cell tapping, swipe panning in the 2D table and infobox viewers, and full-height viewports without obsolete physical-button hint bars.
+- Offline Wikipedia `"On This Day"` calendar-date detection via `.img` `CPR1` footer metadata (`hasDates`) with a fast B-Tree probe fallback for existing `.img` archives, plus an offline month/day picker when the device clock is unset.
+
+### Fixed
+
+- Fix unresponsive touchscreen keyboard and missing clear button in Offline Wikipedia search on X4 Pro.
+- Prevent Offline Wikipedia `"On This Day"` from opening Wi-Fi clock sync automatically when the loaded `.img` lacks date articles or when a valid hardware RTC date is already present.
+
 ## [v1.6.1] - 2026-10-03
 
 ### Added

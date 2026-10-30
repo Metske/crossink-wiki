@@ -9,6 +9,7 @@
 #include <Logging.h>
 #include <algorithm>
 #include <sstream>
+#include "components/TouchHeaderBackButton.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "WikiHtmlToPlainText.h"
@@ -36,10 +37,26 @@ inline char hexToChar(char first, char second) {
 }
 
 constexpr int SIDE_MARGIN = 16;
-constexpr int BOTTOM_MARGIN = WikiGUI::WIKI_HINTS_HEIGHT + 8;
 constexpr int LINE_SPACING = 3;
 constexpr size_t MAX_DECOMPRESS_BYTES = 1000 * 1024;
 constexpr uint32_t IMAGE_DECODE_DEBOUNCE_MS = 65;
+
+int readerHeaderEndY(const ThemeMetrics& metrics, const MappedInputManager& input) {
+    return metrics.topPadding + TouchHeaderBackButton::height(metrics, input);
+}
+
+int readerBottomMargin(const MappedInputManager& input) {
+    return WikiGUI::hintsHeight(input) + 8;
+}
+
+int readerMenuBtnY(const Rect& headerRect, const int btnH) {
+    const auto back = TouchHeaderBackButton::layout(headerRect);
+    const int iconBottom = back.iconRect.y + (back.iconRect.height + TouchHeaderBackButton::ICON_SIZE) / 2;
+    const int availOffset = std::max(0, headerRect.y + headerRect.height - iconBottom);
+    const int offset = std::clamp(TouchHeaderBackButton::TITLE_VERTICAL_OFFSET, 0, availOffset);
+    const int centerY = back.iconRect.y + offset + back.iconRect.height / 2;
+    return centerY - btnH / 2;
+}
 }
 
 
@@ -217,9 +234,9 @@ void WikiReaderActivity::onEnter() {
   if (!loaded_) {
     const int screenHeight = renderer.getScreenHeight();
     const auto& metrics = UITheme::getInstance().getMetrics();
-    const int headerEndY = metrics.topPadding + metrics.headerHeight;
+    const int headerEndY = readerHeaderEndY(metrics, mappedInput);
     const int contentStartY = headerEndY + 8;
-    const int viewportHeight = screenHeight - contentStartY - BOTTOM_MARGIN;
+    const int viewportHeight = screenHeight - contentStartY - readerBottomMargin(mappedInput);
     const int fontId = WikiFont::getBodyFontId();
     const int lineHeight = renderer.getLineHeight(fontId) + LINE_SPACING;
     
@@ -350,7 +367,7 @@ void WikiReaderActivity::formatCurrentPage() {
   const int fontId = bodyFontId;
   const int lineHeight = renderer.getLineHeight(fontId) + LINE_SPACING;
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const int contentStartY = metrics.topPadding + metrics.headerHeight + 8;
+  const int contentStartY = readerHeaderEndY(metrics, mappedInput) + 8;
 
   size_t pLen = chunk.length();
   size_t chunkStartIdx = 0;
@@ -816,7 +833,10 @@ void WikiReaderActivity::formatCurrentPage() {
       if (headLen > 0) fcm->prewarmCache(headingFontId, headPrewarm, 0x02);
   }
 
-  if (pendingRestoreLinkIndex_ >= 0) {
+  if (mappedInput.hasTouchHardware()) {
+      selectedLinkIndex_ = -1;
+      pendingRestoreLinkIndex_ = -1;
+  } else if (pendingRestoreLinkIndex_ >= 0) {
       if (!pageLinks_.empty()) {
           selectedLinkIndex_ = std::min(pendingRestoreLinkIndex_, static_cast<int>(pageLinks_.size()) - 1);
       }
@@ -1038,6 +1058,107 @@ void WikiReaderActivity::followLink(const std::string& rawHref) {
   }
 }
 
+void WikiReaderActivity::openArticleMenuPopup() {
+  static constexpr const char* kTouchOptions[] = {"Table of Contents", "Infobox", "Search Wikipedia"};
+  static constexpr const char* kButtonOptions[] = {"Table of Contents", "Infobox"};
+  const bool hasTouch = mappedInput.hasTouchHardware();
+  const char* const* options = hasTouch ? kTouchOptions : kButtonOptions;
+  const int optionCount = hasTouch ? 3 : 2;
+  optionPopup_.show("Article Menu", options, optionCount, 0, [this](int selected) {
+    if (selected == 0) {
+      if (currentToc_.empty()) {
+        loadTOC();
+      }
+      startActivityForResult(
+          std::make_unique<WikiTocActivity>(renderer, mappedInput, currentToc_),
+          [this](const ActivityResult& result) {
+            if (!result.isCancelled) {
+              if (auto* p = std::get_if<IntervalResult>(&result.data)) {
+                uint32_t targetCharOffset = p->value;
+                history_.push_back({title_, articleOffset_, currentPage_, selectedLinkIndex_});
+                if (history_.size() > 20) history_.erase(history_.begin());
+                jumpTo(targetCharOffset);
+                return;
+              }
+            }
+            pageRedrawNeeded_ = true;
+            pendingImageRender_ = !pageImages_.empty();
+            imageStage2Triggered_ = false;
+          });
+    } else if (selected == 1) {
+      showInfobox();
+    } else if (selected == 2) {
+      closeToSearch();
+    }
+  });
+  requestUpdate();
+}
+
+void WikiReaderActivity::selectPrevLink() {
+  if (selectedLinkIndex_ < 0 && !pageLinks_.empty()) {
+    selectedLinkIndex_ = static_cast<int>(pageLinks_.size()) - 1;
+    syncResumeStateToConfig();
+    requestUpdate();
+    return;
+  }
+  if (selectedLinkIndex_ > 0) {
+    selectedLinkIndex_--;
+    if (pendingImageRender_) {
+      imageDecodeReadyAtMs_ = millis() + IMAGE_DECODE_DEBOUNCE_MS;
+    }
+    syncResumeStateToConfig();
+    requestUpdate();
+  } else if (currentPage_ > 0) {
+    onPrevPage();
+    if (!pageLinks_.empty()) {
+      selectedLinkIndex_ = static_cast<int>(pageLinks_.size()) - 1;
+      syncResumeStateToConfig();
+    }
+  }
+}
+
+void WikiReaderActivity::selectNextLink() {
+  if (selectedLinkIndex_ < 0 && !pageLinks_.empty()) {
+    selectedLinkIndex_ = 0;
+    syncResumeStateToConfig();
+    requestUpdate();
+    return;
+  }
+  if (selectedLinkIndex_ >= 0 && selectedLinkIndex_ + 1 < static_cast<int>(pageLinks_.size())) {
+    selectedLinkIndex_++;
+    if (pendingImageRender_) {
+      imageDecodeReadyAtMs_ = millis() + IMAGE_DECODE_DEBOUNCE_MS;
+    }
+    syncResumeStateToConfig();
+    requestUpdate();
+  } else {
+    int oldPage = currentPage_;
+    onNextPage();
+    if (currentPage_ != oldPage && !pageLinks_.empty()) {
+      selectedLinkIndex_ = 0;
+      syncResumeStateToConfig();
+    }
+  }
+}
+
+bool WikiReaderActivity::followSelectedLink() {
+  if (selectedLinkIndex_ >= 0 && selectedLinkIndex_ < static_cast<int>(pageLinks_.size())) {
+    const auto& pl = pageLinks_[selectedLinkIndex_];
+    std::string href(&hrefPool_[pl.hrefOffset], pl.hrefLen);
+    followLink(href);
+    return true;
+  }
+  return false;
+}
+
+void WikiReaderActivity::closeToSearch() {
+  closedByUser_ = true;
+  ActivityResult result;
+  result.isCancelled = false;
+  setResult(std::move(result));
+  finish();
+}
+
 void WikiReaderActivity::loop() {
   if (optionPopup_.isActive()) {
       if (optionPopup_.handleInput(mappedInput, [this](){ requestUpdate(); })) {
@@ -1046,14 +1167,71 @@ void WikiReaderActivity::loop() {
   }
 
   const auto& metrics = UITheme::getInstance().getMetrics();
+
+#if CROSSINK_APP_CAP_TOUCH
+  if (mappedInput.wasMenuGesture() || mappedInput.wasReaderMenuHold()) {
+    openArticleMenuPopup();
+    return;
+  }
+#endif
+
+  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
+    onBack();
+    return;
+  }
+
   int tx = 0;
   int ty = 0;
   if (mappedInput.wasScreenTapped(tx, ty)) {
-    if (ty < metrics.topPadding + metrics.headerHeight) {
-      onBack();
+    const int pageWidth = renderer.getScreenWidth();
+    const int headerEndY = readerHeaderEndY(metrics, mappedInput);
+    if (ty < headerEndY) {
+      if (tx >= pageWidth - 64) {
+        openArticleMenuPopup();
+      }
       return;
     }
-    const int midX = renderer.getScreenWidth() / 2;
+
+    int matchedLink = -1;
+    for (int linkIdx = 0; linkIdx < static_cast<int>(pageLinks_.size()) && matchedLink < 0; ++linkIdx) {
+      const auto& pl = pageLinks_[linkIdx];
+      for (uint16_t ri = 0; ri < pl.rectCount; ++ri) {
+        const auto& rect = linkRects_[pl.rectStartIdx + ri];
+        if (tx >= rect.x - 2 && tx <= rect.x + rect.width + 2 &&
+            ty >= rect.y - 2 && ty <= rect.y + rect.height + 2) {
+          matchedLink = linkIdx;
+          break;
+        }
+      }
+    }
+    if (matchedLink < 0) {
+      int bestDistSq = INT32_MAX;
+      for (int linkIdx = 0; linkIdx < static_cast<int>(pageLinks_.size()); ++linkIdx) {
+        const auto& pl = pageLinks_[linkIdx];
+        for (uint16_t ri = 0; ri < pl.rectCount; ++ri) {
+          const auto& rect = linkRects_[pl.rectStartIdx + ri];
+          if (tx >= rect.x - 6 && tx <= rect.x + rect.width + 6 &&
+              ty >= rect.y - 8 && ty <= rect.y + rect.height + 8) {
+            const int cx = rect.x + rect.width / 2;
+            const int cy = rect.y + rect.height / 2;
+            const int dx = tx - cx;
+            const int dy = ty - cy;
+            const int d2 = dx * dx + dy * dy;
+            if (d2 < bestDistSq) {
+              bestDistSq = d2;
+              matchedLink = linkIdx;
+            }
+          }
+        }
+      }
+    }
+    if (matchedLink >= 0) {
+      const auto& pl = pageLinks_[matchedLink];
+      std::string href(&hrefPool_[pl.hrefOffset], pl.hrefLen);
+      followLink(href);
+      return;
+    }
+    const int midX = pageWidth / 2;
     if (tx < midX) {
       onPrevPage();
     } else {
@@ -1061,6 +1239,20 @@ void WikiReaderActivity::loop() {
     }
     return;
   }
+
+#if CROSSINK_APP_CAP_TOUCH
+  if (!mappedInput.wasBackGesture()) {
+    const auto swipe = mappedInput.wasSwipe();
+    if (swipe == MappedInputManager::SwipeDir::Left) {
+      onNextPage();
+      return;
+    }
+    if (swipe == MappedInputManager::SwipeDir::Right) {
+      onPrevPage();
+      return;
+    }
+  }
+#endif
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
     onPrevPage();
@@ -1073,92 +1265,30 @@ void WikiReaderActivity::loop() {
   }
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
-    if (selectedLinkIndex_ > 0) {
-        selectedLinkIndex_--;
-        if (pendingImageRender_) {
-            imageDecodeReadyAtMs_ = millis() + IMAGE_DECODE_DEBOUNCE_MS;
-        }
-        syncResumeStateToConfig();
-        requestUpdate();
-    } else if (currentPage_ > 0) {
-        onPrevPage();
-        if (!pageLinks_.empty()) {
-            selectedLinkIndex_ = pageLinks_.size() - 1;
-            syncResumeStateToConfig();
-        }
-    }
+    selectPrevLink();
     return;
   }
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
-    if (selectedLinkIndex_ >= 0 && selectedLinkIndex_ + 1 < static_cast<int>(pageLinks_.size())) {
-        selectedLinkIndex_++;
-        if (pendingImageRender_) {
-            imageDecodeReadyAtMs_ = millis() + IMAGE_DECODE_DEBOUNCE_MS;
-        }
-        syncResumeStateToConfig();
-        requestUpdate();
-    } else {
-        int oldPage = currentPage_;
-        onNextPage();
-        if (currentPage_ != oldPage && !pageLinks_.empty()) {
-            selectedLinkIndex_ = 0;
-            syncResumeStateToConfig();
-        }
-    }
+    selectNextLink();
     return;
   }
 
   if (mappedInput.wasLongPressed(MappedInputManager::Button::Confirm, 500)) {
     mappedInput.consumeSuppressedRelease();
-    
-    const char* options[] = {"Table of Contents", "Infobox"};
-    optionPopup_.show("Article Menu", options, 2, 0, [this](int selected) {
-        if (selected == 0) {
-            if (currentToc_.empty()) {
-                loadTOC();
-            }
-            startActivityForResult(
-                std::make_unique<WikiTocActivity>(renderer, mappedInput, currentToc_),
-                [this](const ActivityResult& result) {
-                    if (!result.isCancelled) {
-                        if (auto* p = std::get_if<IntervalResult>(&result.data)) {
-                            uint32_t targetCharOffset = p->value;
-                            history_.push_back({title_, articleOffset_, currentPage_, selectedLinkIndex_});
-                            if (history_.size() > 20) history_.erase(history_.begin());
-                            jumpTo(targetCharOffset);
-                            return;
-                        }
-                    }
-                    pageRedrawNeeded_ = true;
-                    pendingImageRender_ = !pageImages_.empty();
-                    imageStage2Triggered_ = false;
-                }
-            );
-        } else if (selected == 1) {
-            showInfobox();
-        }
-    });
-    requestUpdate();
+    openArticleMenuPopup();
     return;
   }
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-      if (selectedLinkIndex_ >= 0 && selectedLinkIndex_ < static_cast<int>(pageLinks_.size())) {
-          const auto& pl = pageLinks_[selectedLinkIndex_];
-          std::string href(&hrefPool_[pl.hrefOffset], pl.hrefLen);
-          followLink(href);
-          return;
-      }
+    if (followSelectedLink()) {
+      return;
+    }
   }
 
   if (mappedInput.wasLongPressed(MappedInputManager::Button::Back, 500)) {
     mappedInput.consumeSuppressedRelease();
-    closedByUser_ = true;
-    ActivityResult result;
-    result.isCancelled = false;
-    setResult(std::move(result));
-    finish();
+    closeToSearch();
     return;
   }
 
@@ -1196,7 +1326,7 @@ void WikiReaderActivity::render(RenderLock&&) {
   const auto& metrics = UITheme::getInstance().getMetrics();
   const int fontId = bodyFontId;
   const int lineHeight = renderer.getLineHeight(fontId) + LINE_SPACING;
-  const int contentStartY = metrics.topPadding + metrics.headerHeight + 8;
+  const int contentStartY = readerHeaderEndY(metrics, mappedInput) + 8;
 
   if (popupWasActive_ && !optionPopup_.isActive()) {
     pageRedrawNeeded_ = true;
@@ -1256,6 +1386,14 @@ void WikiReaderActivity::render(RenderLock&&) {
   // just render the popup overlay over the existing framebuffer without re-decoding JPEGs.
   if (!pageRedrawNeeded_ && optionPopup_.isActive()) {
     popupWasActive_ = true;
+    if (mappedInput.hasTouchHardware()) {
+      const Rect headerRect = TouchHeaderBackButton::headerRect(renderer, mappedInput);
+      constexpr int btnW = 30;
+      constexpr int btnH = 22;
+      const int btnX = pageWidth - 16 - btnW;
+      const int btnY = readerMenuBtnY(headerRect, btnH);
+      WikiGUI::drawThreeDotsButton(renderer, btnX, btnY, btnW, btnH, true);
+    }
     optionPopup_.render(renderer);
     renderer.displayBuffer();
     return;
@@ -1390,12 +1528,21 @@ void WikiReaderActivity::render(RenderLock&&) {
     prevPageImageRects_.clear();
   }
 
-  Rect headerRect{0, static_cast<int16_t>(metrics.topPadding), static_cast<int16_t>(pageWidth), static_cast<int16_t>(metrics.headerHeight)};
+  const Rect headerRect = TouchHeaderBackButton::headerRect(renderer, mappedInput);
   std::string displayTitle = title_;
   for (char& c : displayTitle) {
       if (c == '_') c = ' ';
   }
-  GUI.drawHeader(renderer, headerRect, displayTitle.c_str());
+  if (mappedInput.hasTouchHardware()) {
+    TouchHeaderBackButton::draw(renderer, headerRect, displayTitle.c_str(), false, 64);
+    constexpr int btnW = 30;
+    constexpr int btnH = 22;
+    const int btnX = pageWidth - 16 - btnW;
+    const int btnY = readerMenuBtnY(headerRect, btnH);
+    WikiGUI::drawThreeDotsButton(renderer, btnX, btnY, btnW, btnH, optionPopup_.isActive());
+  } else {
+    GUI.drawHeader(renderer, headerRect, displayTitle.c_str());
+  }
 
   for (size_t i = 0; i < currentLines_.size(); ++i) {
     drawPageTextLine(i);

@@ -44,6 +44,7 @@ class WikiSearchActivity : public Activity {
   int selectedResultIndex = -1;
   int setupMenuSelection = 0;
   bool menuButtonSelected_ = false;
+  bool buttonSelectionVisible_ = true;
   bool pendingOnThisDayAfterDateSync_ = false;
   OptionPopup optionPopup_;
 
@@ -71,6 +72,10 @@ class WikiSearchActivity : public Activity {
   void openRandomArticle();
   void openOnThisDayArticle();
   bool openOnThisDayFromTimestamp(uint32_t timestamp);
+  bool openOnThisDayForDate(int monthIdx, int dayNum);
+  void openOfflineDatePicker();
+  void openArchivePicker();
+  void resetToScanPrompt();
   void onCancel();
 
   ButtonNavigator buttonNavigator;

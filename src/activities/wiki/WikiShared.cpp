@@ -20,6 +20,8 @@
 #include "ImageToneMapper.h"
 #include "SdCardFontSystem.h"
 #include "WikiGUI.h"
+#include "WikiSearchEngine.h"
+#include "components/TouchHeaderBackButton.h"
 #include "components/UITheme.h"
 
 static const char* TAG = "WikiShared";
@@ -203,6 +205,9 @@ void loadConfigFromDisk(WikiConfigData& cfg) {
         cfg.fontSector = static_cast<uint32_t>(std::strtoul(line + 12, nullptr, 10));
       } else if (std::strncmp(line, "HAS_IMAGES=", 11) == 0) {
         cfg.hasImages = static_cast<uint8_t>(std::strtoul(line + 11, nullptr, 10) ? 1 : 0);
+      } else if (std::strncmp(line, "HAS_DATES=", 10) == 0) {
+        cfg.hasDates = static_cast<uint8_t>(std::strtoul(line + 10, nullptr, 10) ? WikiConfigData::DATES_PRESENT
+                                                                                   : WikiConfigData::DATES_ABSENT);
       } else if (std::strncmp(line, "RESUME_TITLE=", 13) == 0) {
         std::strncpy(cfg.resumeTitle, line + 13, sizeof(cfg.resumeTitle) - 1);
         cfg.resumeTitle[sizeof(cfg.resumeTitle) - 1] = '\0';
@@ -362,6 +367,13 @@ bool WikiConfig::save() {
       content, sizeof(content),
       "IMAGE_PATH=%s\nINDEX_SECTOR=%u\nCHUNKS_SECTOR=%u\nFONT_SECTOR=%u\nHAS_IMAGES=%u\n",
       cfg.imagePath, cfg.indexSector, cfg.chunksSector, cfg.fontSector, static_cast<unsigned>(cfg.hasImages));
+  if (pos > 0 && static_cast<size_t>(pos) < sizeof(content) && cfg.hasDates != WikiConfigData::DATES_UNKNOWN) {
+    int dn = std::snprintf(content + pos, sizeof(content) - pos, "HAS_DATES=%u\n",
+                           static_cast<unsigned>(cfg.hasDates == WikiConfigData::DATES_PRESENT ? 1 : 0));
+    if (dn > 0 && static_cast<size_t>(pos + dn) < sizeof(content)) {
+      pos += dn;
+    }
+  }
   if (pos > 0 && static_cast<size_t>(pos) < sizeof(content) && cfg.resumeTitle[0] != '\0') {
     int n = std::snprintf(content + pos, sizeof(content) - pos,
                           "RESUME_TITLE=%s\nRESUME_OFFSET=%llu\nRESUME_PAGE=%d\nRESUME_LINK=%d\nRESUME_OFFSETS=",
@@ -426,7 +438,12 @@ bool WikiConfig::configureFromImageFile(const std::string& imgPath) {
       cfg.indexSector = indexSector;
       cfg.chunksSector = chunksSector;
       cfg.fontSector = fontSector;
-      cfg.hasImages = (imageFlags & 1) ? 1 : 0;
+      cfg.hasImages = (imageFlags & 0x1u) ? 1 : 0;
+      if (imageFlags & 0x2u) {
+        cfg.hasDates = (imageFlags & 0x4u) ? WikiConfigData::DATES_PRESENT : WikiConfigData::DATES_ABSENT;
+      } else {
+        cfg.hasDates = WikiConfigData::DATES_UNKNOWN;
+      }
       std::strncpy(cfg.imagePath, imgPath.c_str(), sizeof(cfg.imagePath) - 1);
       cfg.imagePath[sizeof(cfg.imagePath) - 1] = '\0';
       cfg.clearResume();
@@ -436,6 +453,43 @@ bool WikiConfig::configureFromImageFile(const std::string& imgPath) {
   }
   f.close();
   return ok;
+}
+
+bool WikiConfig::resolveHasDates(WikiSearchEngine& engine, SdRawReader& reader) {
+  WikiConfigData& cfg = get();
+  if (cfg.hasDates != WikiConfigData::DATES_UNKNOWN) {
+    return cfg.hasDates == WikiConfigData::DATES_PRESENT;
+  }
+  if (cfg.indexSector == 0) {
+    return false;
+  }
+  if (!reader.isMounted() && !reader.mount(-1, -1, -1, -1)) {
+    return false;
+  }
+  engine.setRootSector(cfg.indexSector);
+
+  // Backwards-compatible B-Tree probe for legacy .img archives built before CPR1 FlagDatesKnown (0x2):
+  // Check 6 ordinary mid-month dates spread across the year so partial dumps (e.g. top_maxi, which
+  // only contains Feb 25 & Jun 6) resolve to false while full Wikipedia dumps resolve to true in <5 ms.
+  static constexpr const char* kProbes[6][3] = {
+      {"January 15", "january 15", "15 january"},
+      {"March 19", "march 19", "19 march"},
+      {"May 12", "may 12", "12 may"},
+      {"July 22", "july 22", "22 july"},
+      {"September 18", "september 18", "18 september"},
+      {"November 14", "november 14", "14 november"},
+  };
+  int found = 0;
+  uint64_t dummyOffset = 0;
+  for (int i = 0; i < 6; ++i) {
+    if (engine.search(kProbes[i][0], dummyOffset) || engine.search(kProbes[i][1], dummyOffset) ||
+        engine.search(kProbes[i][2], dummyOffset)) {
+      ++found;
+    }
+  }
+  cfg.hasDates = (found >= 5) ? WikiConfigData::DATES_PRESENT : WikiConfigData::DATES_ABSENT;
+  save();
+  return cfg.hasDates == WikiConfigData::DATES_PRESENT;
 }
 
 namespace WikiJpeg {
@@ -681,15 +735,21 @@ void WikiFileSelectActivity::loadFiles() {
   }
 }
 
+void WikiFileSelectActivity::onEnter() {
+  buttonSelectionVisible_ = !mappedInput.hasTouchHardware();
+  UiListActivity::onEnter();
+}
+
 int WikiFileSelectActivity::listCount() const { return static_cast<int>(entries_.size()); }
 
 const char* WikiFileSelectActivity::headerTitle() const { return "Select Wikipedia .img"; }
 
 void WikiFileSelectActivity::buildScreen(UiScreen& screen) {
   const auto& metrics = UITheme::getInstance().getMetrics();
+  const int headerH = TouchHeaderBackButton::height(metrics, mappedInput);
   screen.setContentMarginFromScreen(freeink::ui::Insets{
-      static_cast<int16_t>(metrics.topPadding + metrics.headerHeight + 12), 0,
-      static_cast<int16_t>(WikiGUI::WIKI_HINTS_HEIGHT), 0});
+      static_cast<int16_t>(metrics.topPadding + headerH + (mappedInput.hasTouchHardware() ? 4 : 12)), 0,
+      static_cast<int16_t>(WikiGUI::hintsHeight(mappedInput)), 0});
   screen.spacer(static_cast<int16_t>(metrics.verticalSpacing));
 
   freeink::ui::ListProps props;
@@ -698,7 +758,20 @@ void WikiFileSelectActivity::buildScreen(UiScreen& screen) {
   props.action = ACTION_ROW;
   props.inputMask = freeink::ui::InputTouch;
   syncListViewport(screen, props);
+  if (!buttonSelectionVisible_) {
+    props.selectedIndex = -1;
+  }
   screen.list(props);
+}
+
+void WikiFileSelectActivity::navigateButtons() {
+  if (mappedInput.wasPressed(MappedInputManager::Button::Up) ||
+      mappedInput.wasPressed(MappedInputManager::Button::Down) ||
+      mappedInput.wasPressed(MappedInputManager::Button::Left) ||
+      mappedInput.wasPressed(MappedInputManager::Button::Right)) {
+    buttonSelectionVisible_ = true;
+  }
+  UiListActivity::navigateButtons();
 }
 
 void WikiFileSelectActivity::activateIndex(int index) {
@@ -738,6 +811,25 @@ void WikiFileSelectActivity::onBackButton() {
   finish();
 }
 
+bool WikiFileSelectActivity::handleCustomInput() {
+  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
+    onBackButton();
+    return true;
+  }
+  return false;
+}
+
+void WikiFileSelectActivity::drawChrome() {
+  const char* title = headerTitle();
+  if (!title) return;
+  const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
+  if (mappedInput.hasTouchHardware()) {
+    TouchHeaderBackButton::draw(renderer, header, title, false);
+  } else {
+    GUI.drawHeader(renderer, header, title);
+  }
+}
+
 void WikiFileSelectActivity::drawFooter() {
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_UP), tr(STR_DIR_DOWN));
   WikiGUI::drawDoubleButtonHints(renderer, {labels.btn1, ""}, {labels.btn2, ""}, {labels.btn3, ""}, {labels.btn4, ""});
@@ -752,7 +844,9 @@ void WikiRecentActivity::onEnter() {
   Activity::onEnter();
   const auto& cfg = WikiConfig::get();
   const int totalSelectable = static_cast<int>(cfg.recentSearches.size() + cfg.recentVisited.size()) + 1;
-  if (selectedIndex_ < 0 || selectedIndex_ >= totalSelectable) {
+  if (mappedInput.hasTouchHardware()) {
+    selectedIndex_ = -1;
+  } else if (selectedIndex_ < 0 || selectedIndex_ >= totalSelectable) {
     selectedIndex_ = 0;
   }
   requestUpdate();
@@ -771,7 +865,7 @@ void WikiRecentActivity::activateSelection() {
   } else {
     cfg.clearRecentHistory();
     WikiConfig::save();
-    selectedIndex_ = 0;
+    selectedIndex_ = mappedInput.hasTouchHardware() ? -1 : 0;
     requestUpdate();
     return;
   }
@@ -789,7 +883,8 @@ void WikiRecentActivity::activateSelection() {
 }
 
 void WikiRecentActivity::loop() {
-  if (mappedInput.wasReleased(MappedInputManager::Button::Back) ||
+  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer) ||
+      mappedInput.wasReleased(MappedInputManager::Button::Back) ||
       mappedInput.wasBackGesture() || mappedInput.wasHomeGesture()) {
     ActivityResult res;
     res.isCancelled = true;
@@ -807,12 +902,8 @@ void WikiRecentActivity::loop() {
   int ty = 0;
   if (mappedInput.wasScreenTapped(tx, ty)) {
     const auto& metrics = UITheme::getInstance().getMetrics();
-    const int headerEndY = metrics.topPadding + metrics.headerHeight;
+    const int headerEndY = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
     if (ty < headerEndY) {
-      ActivityResult res;
-      res.isCancelled = true;
-      setResult(std::move(res));
-      finish();
       return;
     }
 
@@ -850,19 +941,19 @@ void WikiRecentActivity::loop() {
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Up) ||
       mappedInput.wasPressed(MappedInputManager::Button::Left)) {
-    selectedIndex_ = (selectedIndex_ - 1 + totalSelectable) % totalSelectable;
+    selectedIndex_ = (selectedIndex_ <= 0) ? (totalSelectable - 1) : (selectedIndex_ - 1);
     requestUpdate();
     return;
   }
 
   if (mappedInput.wasPressed(MappedInputManager::Button::Down) ||
       mappedInput.wasPressed(MappedInputManager::Button::Right)) {
-    selectedIndex_ = (selectedIndex_ + 1) % totalSelectable;
+    selectedIndex_ = (selectedIndex_ < 0) ? 0 : ((selectedIndex_ + 1) % totalSelectable);
     requestUpdate();
     return;
   }
 
-  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+  if (mappedInput.wasReleased(MappedInputManager::Button::Confirm) && selectedIndex_ >= 0) {
     activateSelection();
     return;
   }
@@ -873,14 +964,18 @@ void WikiRecentActivity::render(RenderLock&&) {
 
   const int pageWidth = renderer.getScreenWidth();
   const auto& metrics = UITheme::getInstance().getMetrics();
-  const Rect header{0, metrics.topPadding, pageWidth, metrics.headerHeight};
-  GUI.drawHeader(renderer, header, "Recent");
+  const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
+  if (mappedInput.hasTouchHardware()) {
+    TouchHeaderBackButton::draw(renderer, header, "Recent", false);
+  } else {
+    GUI.drawHeader(renderer, header, "Recent");
+  }
 
   const auto& cfg = WikiConfig::get();
   const int sCount = static_cast<int>(cfg.recentSearches.size());
   const int vCount = static_cast<int>(cfg.recentVisited.size());
 
-  const int headerEndY = metrics.topPadding + metrics.headerHeight;
+  const int headerEndY = header.y + header.height;
   constexpr int kSectionHeaderH = 26;
   constexpr int kRowH = 28;
 

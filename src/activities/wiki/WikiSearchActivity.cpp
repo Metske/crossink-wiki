@@ -23,6 +23,7 @@
 #include "WikiTextFormatter.h"
 #include "activities/ActivityManager.h"
 #include "activities/settings/ClockSyncActivity.h"
+#include "components/TouchHeaderBackButton.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include "WikiGUI.h"
@@ -32,6 +33,7 @@
 namespace fui = freeink::ui;
 
 static const char* TAG = "WikiSearchActivity";
+static constexpr fui::ActionId ACTION_KEY = 1;
 
 WikiSearchActivity::WikiSearchActivity(GfxRenderer& renderer, MappedInputManager& mappedInput,
                                        std::string initialQuery, bool allowFastInitialRefresh)
@@ -50,7 +52,8 @@ WikiSearchActivity::~WikiSearchActivity() {
 
 void WikiSearchActivity::onEnter() {
   Activity::onEnter();
-  interactionsReady = false;
+  buttonSelectionVisible_ = !mappedInput.hasTouchHardware();
+  interactionsReady.store(false, std::memory_order_relaxed);
   if (auto fcm = renderer.getFontCacheManager()) {
     fcm->clearCache();
   }
@@ -68,13 +71,18 @@ void WikiSearchActivity::onEnter() {
         uint32_t idxSec = footer[4] | (footer[5] << 8) | (footer[6] << 16) | (footer[7] << 24);
         uint32_t chunkSec = footer[8] | (footer[9] << 8) | (footer[10] << 16) | (footer[11] << 24);
         uint32_t fontSec = footer[12] | (footer[13] << 8) | (footer[14] << 16) | (footer[15] << 24);
-        uint8_t hasImg = (footer[16] & 1) ? 1 : 0;
+        uint32_t footerFlags = footer[16] | (footer[17] << 8) | (footer[18] << 16) | (footer[19] << 24);
+        uint8_t hasImg = (footerFlags & 0x1u) ? 1 : 0;
+        uint8_t footerDates = (footerFlags & 0x2u)
+                                  ? ((footerFlags & 0x4u) ? WikiConfigData::DATES_PRESENT : WikiConfigData::DATES_ABSENT)
+                                  : ((cfg.indexSector == idxSec) ? cfg.hasDates : WikiConfigData::DATES_UNKNOWN);
         if (idxSec > 0 && (cfg.indexSector != idxSec || cfg.chunksSector != chunkSec ||
-                           cfg.fontSector != fontSec || cfg.hasImages != hasImg)) {
+                           cfg.fontSector != fontSec || cfg.hasImages != hasImg || cfg.hasDates != footerDates)) {
           cfg.indexSector = idxSec;
           cfg.chunksSector = chunkSec;
           cfg.fontSector = fontSec;
           cfg.hasImages = hasImg;
+          cfg.hasDates = footerDates;
           WikiConfig::save();
         }
       }
@@ -84,6 +92,7 @@ void WikiSearchActivity::onEnter() {
     rootSector_ = cfg.indexSector;
     searchEngine_.setRootSector(rootSector_);
     viewState_ = ViewState::SearchReady;
+    WikiConfig::resolveHasDates(searchEngine_, reader_);
     if (pendingOnThisDayAfterDateSync_) {
       pendingOnThisDayAfterDateSync_ = false;
       if (openOnThisDayFromTimestamp(0)) {
@@ -449,30 +458,7 @@ void WikiSearchActivity::openRandomArticle() {
   }
 }
 
-bool WikiSearchActivity::openOnThisDayFromTimestamp(uint32_t) {
-  uint16_t year = 0;
-  uint8_t month = 0;
-  uint8_t day = 0;
-  uint8_t hour = 0;
-  uint8_t minute = 0;
-  int mon = -1;
-  int mday = -1;
-  if (halClock.isAvailable() && SETTINGS.clockDateHasBeenSynced &&
-      halClock.getDateTime(year, month, day, hour, minute) && year >= 2024 && month >= 1 && month <= 12 &&
-      day >= 1 && day <= 31) {
-    mon = static_cast<int>(month) - 1;
-    mday = static_cast<int>(day);
-  } else {
-    time_t currentTime = time(nullptr);
-    tm localTime{};
-    if (currentTime > 1704067200 && localtime_r(&currentTime, &localTime) != nullptr) {
-      mon = std::clamp(localTime.tm_mon, 0, 11);
-      mday = std::clamp(localTime.tm_mday, 1, 31);
-    } else {
-      return false;
-    }
-  }
-
+bool WikiSearchActivity::openOnThisDayForDate(const int monthIdx, const int dayNumIn) {
   static constexpr const char* kMonths[12] = {
       "January", "February", "March",     "April",   "May",      "June",
       "July",    "August",   "September", "October", "November", "December",
@@ -482,7 +468,8 @@ bool WikiSearchActivity::openOnThisDayFromTimestamp(uint32_t) {
       "july",    "august",   "september", "october", "november", "december",
   };
 
-  const int dayNum = std::clamp(mday, 1, 31);
+  const int mon = std::clamp(monthIdx, 0, 11);
+  const int dayNum = std::clamp(dayNumIn, 1, 31);
 
   const char* suffix = "th";
   if (dayNum % 100 < 11 || dayNum % 100 > 13) {
@@ -514,27 +501,165 @@ bool WikiSearchActivity::openOnThisDayFromTimestamp(uint32_t) {
   return false;
 }
 
+bool WikiSearchActivity::openOnThisDayFromTimestamp(uint32_t) {
+  uint16_t year = 0;
+  uint8_t month = 0;
+  uint8_t day = 0;
+  uint8_t hour = 0;
+  uint8_t minute = 0;
+  int mon = -1;
+  int mday = -1;
+  // Accept valid hardware RTC dates (e.g. X4 Pro BM8563) even when NTP has never synced over Wi-Fi.
+  if (halClock.isAvailable() && halClock.getDateTime(year, month, day, hour, minute) && year >= 2024 &&
+      month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+    mon = static_cast<int>(month) - 1;
+    mday = static_cast<int>(day);
+  } else {
+    time_t currentTime = time(nullptr);
+    tm localTime{};
+    if (currentTime > 1704067200 && localtime_r(&currentTime, &localTime) != nullptr) {
+      mon = std::clamp(localTime.tm_mon, 0, 11);
+      mday = std::clamp(localTime.tm_mday, 1, 31);
+    } else {
+      return false;
+    }
+  }
+
+  if (openOnThisDayForDate(mon, mday)) {
+    return true;
+  }
+
+  static constexpr const char* kOkOptions[] = {"OK"};
+  optionPopup_.show("On This Day Unavailable", kOkOptions, 1, 0, [this](int) { requestUpdate(); },
+                    OptionPopup::Note("Note:", "Date article was not found in this .img."));
+  requestUpdate();
+  return true;
+}
+
+void WikiSearchActivity::openOfflineDatePicker() {
+  static constexpr const char* kMonths[12] = {
+      "January", "February", "March",     "April",   "May",      "June",
+      "July",    "August",   "September", "October", "November", "December",
+  };
+  static constexpr int kDaysInMonth[12] = {31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+
+  optionPopup_.show("Select Month", kMonths, 12, 0, [this](int monthIdx) {
+    if (monthIdx < 0 || monthIdx >= 12) return;
+    const int daysCount = kDaysInMonth[monthIdx];
+    std::vector<std::string> dayOptions;
+    dayOptions.reserve(static_cast<size_t>(daysCount));
+    for (int d = 1; d <= daysCount; ++d) {
+      char buf[8];
+      std::snprintf(buf, sizeof(buf), "%d", d);
+      dayOptions.emplace_back(buf);
+    }
+    optionPopup_.skipPostSelectionUpdate();
+    optionPopup_.show(kMonths[monthIdx], dayOptions, 0, [this, monthIdx](int dayIdx) {
+      if (!openOnThisDayForDate(monthIdx, dayIdx + 1)) {
+        static constexpr const char* kOkOptions[] = {"OK"};
+        optionPopup_.skipPostSelectionUpdate();
+        optionPopup_.show("On This Day Unavailable", kOkOptions, 1, 0, [this](int) { requestUpdate(); },
+                          OptionPopup::Note("Note:", "Date article was not found in this .img."));
+      }
+      requestUpdate();
+    });
+    requestUpdate();
+  });
+  requestUpdate();
+}
+
 void WikiSearchActivity::openOnThisDayArticle() {
+  if (!WikiConfig::resolveHasDates(searchEngine_, reader_)) {
+    static constexpr const char* kOkOptions[] = {"OK"};
+    optionPopup_.show("On This Day Unavailable", kOkOptions, 1, 0, [this](int) { requestUpdate(); },
+                      OptionPopup::Note("Note:", "Loaded .img does not include date articles."));
+    requestUpdate();
+    return;
+  }
+
   if (openOnThisDayFromTimestamp(0)) {
     return;
   }
 
-  pendingOnThisDayAfterDateSync_ = true;
-  startActivityForResult(std::make_unique<ClockSyncActivity>(renderer, mappedInput),
-                         [this](const ActivityResult&) { requestUpdate(); });
+  static constexpr const char* kClockOptions[] = {"Pick date offline", "Sync clock via Wi-Fi", "Cancel"};
+  optionPopup_.show("Device Clock Not Set", kClockOptions, 3, 0, [this](int selected) {
+    if (selected == 0) {
+      optionPopup_.skipPostSelectionUpdate();
+      openOfflineDatePicker();
+    } else if (selected == 1) {
+      pendingOnThisDayAfterDateSync_ = true;
+      startActivityForResult(std::make_unique<ClockSyncActivity>(renderer, mappedInput),
+                             [this](const ActivityResult&) { requestUpdate(); });
+    }
+  });
+  requestUpdate();
+}
+
+void WikiSearchActivity::openArchivePicker() {
+  startActivityForResult(std::make_unique<WikiFileSelectActivity>(renderer, mappedInput, "/"),
+                         [this](const ActivityResult& result) {
+                           if (auto* fileRes = std::get_if<FilePathResult>(&result.data)) {
+                             if (!fileRes->path.empty()) {
+                               if (WikiConfig::configureFromImageFile(fileRes->path)) {
+                                 reader_.unmount();
+                                 reader_.mount(-1, -1, -1, -1);
+                                 rootSector_ = WikiConfig::get().indexSector;
+                                 searchEngine_.setRootSector(rootSector_);
+                                 WikiConfig::resolveHasDates(searchEngine_, reader_);
+                                 text.clear();
+                                 cursorPos = 0;
+                                 resultCount = 0;
+                                 currentPageIndex = 0;
+                                 selectedResultIndex = -1;
+                                 viewState_ = ViewState::SearchReady;
+                                 requestUpdate();
+                                 return;
+                               }
+                               viewState_ = ViewState::ScanFailed;
+                               requestUpdate();
+                             }
+                           }
+                         });
 }
 
 void WikiSearchActivity::openSearchMenuPopup() {
-  static constexpr const char* kOptions[] = {"Recent", "Random article", "On this day"};
-  optionPopup_.show("Wikipedia Menu", kOptions, 3, 0, [this](int selected) {
-    if (selected == 0) {
-      openRecentActivity();
-    } else if (selected == 1) {
-      openRandomArticle();
-    } else if (selected == 2) {
-      openOnThisDayArticle();
-    }
-  });
+  if (mappedInput.hasTouchHardware()) {
+    static constexpr const char* kTouchOptions[] = {"Recent", "Random article", "On this day", "Switch archive"};
+    optionPopup_.show("Wikipedia Menu", kTouchOptions, 4, 0, [this](int selected) {
+      if (selected == 0) {
+        openRecentActivity();
+      } else if (selected == 1) {
+        openRandomArticle();
+      } else if (selected == 2) {
+        openOnThisDayArticle();
+      } else if (selected == 3) {
+        openArchivePicker();
+      }
+    });
+  } else {
+    static constexpr const char* kOptions[] = {"Recent", "Random article", "On this day"};
+    optionPopup_.show("Wikipedia Menu", kOptions, 3, 0, [this](int selected) {
+      if (selected == 0) {
+        openRecentActivity();
+      } else if (selected == 1) {
+        openRandomArticle();
+      } else if (selected == 2) {
+        openOnThisDayArticle();
+      }
+    });
+  }
+  requestUpdate();
+}
+
+void WikiSearchActivity::resetToScanPrompt() {
+  cancelPreviewTask();
+  reader_.unmount();
+  WikiConfig::clear();
+  rootSector_ = 0;
+  resultCount = 0;
+  selectedResultIndex = -1;
+  menuButtonSelected_ = false;
+  viewState_ = ViewState::NeedsScan;
   requestUpdate();
 }
 
@@ -555,7 +680,7 @@ fui::Rect WikiSearchActivity::keyboardRect() const {
   const int height = rows * metrics.keyboardKeyHeight + (rows > 1 ? (rows - 1) * gap : 0);
   const int width = pageWidth * metrics.keyboardWidthPercent / 100;
   const int x = (pageWidth - width) / 2;
-  const int y = pageHeight - WikiGUI::WIKI_HINTS_HEIGHT - metrics.verticalSpacing - height +
+  const int y = pageHeight - WikiGUI::hintsHeight(mappedInput) - metrics.verticalSpacing - height +
                 metrics.keyboardVerticalOffset;
   return fui::Rect{static_cast<int16_t>(x), static_cast<int16_t>(y), static_cast<int16_t>(width),
                    static_cast<int16_t>(height)};
@@ -568,37 +693,20 @@ void WikiSearchActivity::loop() {
     }
   }
 
-  const auto& metrics = UITheme::getInstance().getMetrics();
-  int tx = 0;
-  int ty = 0;
-  if (mappedInput.wasScreenTapped(tx, ty) && ty < metrics.topPadding + metrics.headerHeight) {
+  if (TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
     onCancel();
     return;
   }
 
+  const auto& metrics = UITheme::getInstance().getMetrics();
+  const int headerEndY = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
+
   if (viewState_ == ViewState::NeedsScan || viewState_ == ViewState::ScanFailed) {
     int sx = 0;
     int sy = 0;
-    if (mappedInput.wasScreenTapped(sx, sy) ||
+    if ((mappedInput.wasScreenTapped(sx, sy) && sy >= headerEndY) ||
         mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
-      startActivityForResult(std::make_unique<WikiFileSelectActivity>(renderer, mappedInput, "/"),
-                             [this](const ActivityResult& result) {
-                               if (auto* fileRes = std::get_if<FilePathResult>(&result.data)) {
-                                 if (!fileRes->path.empty()) {
-                                   if (WikiConfig::configureFromImageFile(fileRes->path)) {
-                                     reader_.unmount();
-                                     reader_.mount(-1, -1, -1, -1);
-                                     rootSector_ = WikiConfig::get().indexSector;
-                                     searchEngine_.setRootSector(rootSector_);
-                                     viewState_ = ViewState::SearchReady;
-                                     requestUpdate();
-                                     return;
-                                   }
-                                   viewState_ = ViewState::ScanFailed;
-                                   requestUpdate();
-                                 }
-                               }
-                             });
+      openArchivePicker();
       return;
     }
     if (mappedInput.wasReleased(MappedInputManager::Button::Back) ||
@@ -610,20 +718,29 @@ void WikiSearchActivity::loop() {
   }
 
   // --- SearchReady ViewState handling ---
-  const int headerEndY = metrics.topPadding + metrics.headerHeight;
   const int inputY = headerEndY + 6;
   const int inputHeight = renderer.getLineHeight(UI_12_FONT_ID);
   const int listStartY = inputY + inputHeight + 4;
   constexpr int rowHeight = 26;
 
+  int tx = 0;
+  int ty = 0;
   if (mappedInput.wasScreenTapped(tx, ty)) {
-    if (text.empty()) {
-      const int pageWidth = renderer.getScreenWidth();
-      if (tx >= pageWidth - 56 && ty >= inputY - 4 && ty <= inputY + inputHeight + 4) {
-        menuButtonSelected_ = true;
+    const int pageWidth = renderer.getScreenWidth();
+    if (tx >= pageWidth - 56 && ty >= inputY - 6 && ty <= inputY + inputHeight + 6) {
+      if (text.empty()) {
+        menuButtonSelected_ = false;
         openSearchMenuPopup();
-        return;
+      } else {
+        text.clear();
+        cursorPos = 0;
+        resultCount = 0;
+        currentPageIndex = 0;
+        selectedResultIndex = -1;
+        menuButtonSelected_ = false;
+        requestUpdate();
       }
+      return;
     }
     // Check if user tapped a search result
     int baseIdx = currentPageIndex * 10;
@@ -637,7 +754,31 @@ void WikiSearchActivity::loop() {
         }
       }
     }
+    // If preview box is currently shown instead of keyboard, tapping it opens the previewed result
+    if (selectedResultIndex >= 0 && selectedResultIndex < resultCount && selectedResultIndex < 60) {
+      const fui::Rect kbRect = keyboardRect();
+      if (ty >= kbRect.y && ty < kbRect.y + kbRect.height) {
+        openArticle(searchResults[selectedResultIndex].title, searchResults[selectedResultIndex].offset, true);
+        return;
+      }
+    }
   }
+
+#if CROSSINK_APP_CAP_TOUCH
+  if (resultCount > 0 && !mappedInput.wasBackGesture()) {
+    const auto swipe = mappedInput.wasSwipe();
+    if (swipe == MappedInputManager::SwipeDir::Up) {
+      turnResultsPage(1);
+      requestUpdate();
+      return;
+    }
+    if (swipe == MappedInputManager::SwipeDir::Down) {
+      turnResultsPage(-1);
+      requestUpdate();
+      return;
+    }
+  }
+#endif
 
   if (previewTaskHandle && previewTaskFinished.load()) {
     cancelPreviewTask();
@@ -686,7 +827,7 @@ void WikiSearchActivity::loop() {
       requestUpdate();
   }
 
-  if (interactionsReady) {
+  if (interactionsReady.load(std::memory_order_acquire)) {
     if (viewState_ == ViewState::SearchReady) {
         if (selectedResultIndex >= 0 || menuButtonSelected_) {
             if (mappedInput.wasReleased(MappedInputManager::Button::Back) || mappedInput.wasBackGesture()) {
@@ -698,7 +839,8 @@ void WikiSearchActivity::loop() {
         }
     }
     int tapCandidateX = 0, tapCandidateY = 0;
-    const bool tapCandidate = mappedInput.wasScreenTouchDown(tapCandidateX, tapCandidateY);
+    unsigned long touchHeldMs = 0;
+    const bool tapCandidate = mappedInput.isScreenTouchTapCandidate(tapCandidateX, tapCandidateY, touchHeldMs);
     int tapX = 0, tapY = 0;
     const bool tapped = mappedInput.wasScreenTapped(tapX, tapY);
     int hx = 0, hy = 0;
@@ -709,6 +851,8 @@ void WikiSearchActivity::loop() {
         static_cast<int16_t>(tapCandidateY), tapped, static_cast<int16_t>(tapX),
         static_cast<int16_t>(tapY), inContact, millis());
     if (result.event) {
+      menuButtonSelected_ = false;
+      buttonSelectionVisible_ = false;
       syncSelectionToValue(result.event.value);
       if (activateValue(result.event.value, result.event.longPress)) {
         requestUpdate();
@@ -719,10 +863,12 @@ void WikiSearchActivity::loop() {
 
   // Hardware button navigation
   buttonNavigator.onRelease({MappedInputManager::Button::Up}, [this] {
+    buttonSelectionVisible_ = true;
     moveSelectionRow(-1);
     requestUpdate();
   });
   buttonNavigator.onLongPressOnce({MappedInputManager::Button::Up}, [this] {
+    buttonSelectionVisible_ = true;
     if (text.empty()) {
       menuButtonSelected_ = true;
       selectedResultIndex = -1;
@@ -735,10 +881,12 @@ void WikiSearchActivity::loop() {
   });
 
   buttonNavigator.onRelease({MappedInputManager::Button::Down}, [this] {
+    buttonSelectionVisible_ = true;
     moveSelectionRow(1);
     requestUpdate();
   });
   buttonNavigator.onLongPressOnce({MappedInputManager::Button::Down}, [this] {
+    buttonSelectionVisible_ = true;
     if (menuButtonSelected_ || selectedResultIndex >= 0) {
       menuButtonSelected_ = false;
       selectedResultIndex = -1;
@@ -751,6 +899,7 @@ void WikiSearchActivity::loop() {
   });
 
   buttonNavigator.onRelease({MappedInputManager::Button::Left}, [this] {
+    buttonSelectionVisible_ = true;
     moveSelectionCol(-1);
     requestUpdate();
   });
@@ -760,6 +909,7 @@ void WikiSearchActivity::loop() {
   });
 
   buttonNavigator.onRelease({MappedInputManager::Button::Right}, [this] {
+    buttonSelectionVisible_ = true;
     moveSelectionCol(1);
     requestUpdate();
   });
@@ -769,6 +919,7 @@ void WikiSearchActivity::loop() {
   });
 
   if (mappedInput.wasLongPressed(MappedInputManager::Button::Confirm, 600)) {
+    buttonSelectionVisible_ = true;
     if (selectedResultIndex < 0) {
       const fui::KeyboardKey* selKey = selectedKey();
       if (selKey) {
@@ -780,6 +931,11 @@ void WikiSearchActivity::loop() {
   }
 
   if (mappedInput.wasReleased(MappedInputManager::Button::Confirm)) {
+    if (mappedInput.hasTouchHardware() && !buttonSelectionVisible_ && selectedResultIndex < 0 && !menuButtonSelected_) {
+      buttonSelectionVisible_ = true;
+      requestUpdate();
+      return;
+    }
     LOG_INF(TAG, "Confirm button released, selectedResultIndex=%d, selRow=%d, selCol=%d", selectedResultIndex, selRow, selCol);
     if (menuButtonSelected_ && text.empty()) {
       openSearchMenuPopup();
@@ -806,15 +962,7 @@ void WikiSearchActivity::loop() {
 
   if (mappedInput.wasLongPressed(MappedInputManager::Button::Back, 600)) {
     mappedInput.consumeSuppressedRelease();
-    cancelPreviewTask();
-    reader_.unmount();
-    WikiConfig::clear();
-    rootSector_ = 0;
-    resultCount = 0;
-    selectedResultIndex = -1;
-    menuButtonSelected_ = false;
-    viewState_ = ViewState::NeedsScan;
-    requestUpdate();
+    resetToScanPrompt();
     return;
   }
 
@@ -828,11 +976,12 @@ void WikiSearchActivity::loop() {
 void WikiSearchActivity::render(RenderLock&&) {
   renderer.clearScreen();
 
-  const int pageWidth = renderer.getScreenWidth();
-  const auto& metrics = UITheme::getInstance().getMetrics();
-
-  const Rect header{0, metrics.topPadding, pageWidth, metrics.headerHeight};
-  GUI.drawHeader(renderer, header, "Wikipedia");
+  const Rect header = TouchHeaderBackButton::headerRect(renderer, mappedInput);
+  if (mappedInput.hasTouchHardware()) {
+    TouchHeaderBackButton::draw(renderer, header, "Wikipedia", false);
+  } else {
+    GUI.drawHeader(renderer, header, "Wikipedia");
+  }
 
   if (viewState_ == ViewState::NeedsScan) {
     renderScanPromptUi("No Wikipedia .img configured.");
@@ -876,7 +1025,7 @@ void WikiSearchActivity::renderSearchUi() {
   const int pageWidth = renderer.getScreenWidth();
   const auto& metrics = UITheme::getInstance().getMetrics();
 
-  const int headerEndY = metrics.topPadding + metrics.headerHeight;
+  const int headerEndY = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
 
   // Search input field placed safely below the header band
   const int inputY = headerEndY + 6;
@@ -884,24 +1033,19 @@ void WikiSearchActivity::renderSearchUi() {
   std::string displayQuery = "Search: " + text.substr(0, cursorPos) + "_" + text.substr(cursorPos);
   renderer.drawText(UI_12_FONT_ID, 16, inputY, displayQuery.c_str(), true, EpdFontFamily::BOLD);
 
+  constexpr int btnW = 30;
+  const int btnH = inputHeight;
+  const int btnX = pageWidth - 16 - btnW;
+  const int btnY = inputY;
   if (text.empty()) {
-    constexpr int btnW = 30;
-    const int btnH = inputHeight;
-    const int btnX = pageWidth - 16 - btnW;
-    const int btnY = inputY;
-    const int dotY = btnY + (btnH - 3) / 2;
-    const int dotStartX = btnX + (btnW - 15) / 2;
-    if (menuButtonSelected_) {
-      renderer.fillRect(btnX, btnY, btnW, btnH, true);
-      renderer.fillRect(dotStartX, dotY, 3, 3, false);
-      renderer.fillRect(dotStartX + 6, dotY, 3, 3, false);
-      renderer.fillRect(dotStartX + 12, dotY, 3, 3, false);
-    } else {
-      renderer.drawRect(btnX, btnY, btnW, btnH, true);
-      renderer.fillRect(dotStartX, dotY, 3, 3, true);
-      renderer.fillRect(dotStartX + 6, dotY, 3, 3, true);
-      renderer.fillRect(dotStartX + 12, dotY, 3, 3, true);
-    }
+    const bool menuHighlighted = menuButtonSelected_ || (mappedInput.hasTouchHardware() && optionPopup_.isActive());
+    WikiGUI::drawThreeDotsButton(renderer, btnX, btnY, btnW, btnH, menuHighlighted);
+  } else if (mappedInput.hasTouchHardware()) {
+    renderer.drawRect(btnX, btnY, btnW, btnH, true);
+    const int xw = renderer.getTextWidth(UI_10_FONT_ID, "x", EpdFontFamily::BOLD);
+    const int xh = renderer.getLineHeight(UI_10_FONT_ID);
+    renderer.drawText(UI_10_FONT_ID, btnX + (btnW - xw) / 2, btnY + std::max(0, (btnH - xh) / 2 - 1), "x", true,
+                      EpdFontFamily::BOLD);
   }
 
   // Search results list (up to 10 results)
@@ -952,7 +1096,7 @@ void WikiSearchActivity::renderSearchUi() {
   } // close else block for !text.empty()
 
   if (selectedResultIndex >= 0) {
-      const int hintsTop = renderer.getScreenHeight() - WikiGUI::WIKI_HINTS_HEIGHT;
+      const int hintsTop = renderer.getScreenHeight() - WikiGUI::hintsHeight(mappedInput);
       int previewBoxY = listStartY + 10 * rowHeight + 10;
       int previewBoxHeight = hintsTop - previewBoxY - 10;
       renderer.drawRect(10, previewBoxY, pageWidth - 20, previewBoxHeight, true);
@@ -966,7 +1110,10 @@ void WikiSearchActivity::renderSearchUi() {
       for (size_t j = 0; j < lines.size(); ++j) {
           previewFormatter.drawText(15, previewBoxY + 5 + j * lh, lines[j].c_str(), true, false);
       }
-      interactionsReady = true;
+      interactions.beginPublishCycle();
+      interactions.clear();
+      interactions.publish();
+      interactionsReady.store(true, std::memory_order_release);
   } else {
       // FreeInkUI Keyboard
       const fui::Rect kbRect = keyboardRect();
@@ -975,26 +1122,28 @@ void WikiSearchActivity::renderSearchUi() {
       target.setFont(fui::GfxRendererTarget::FONT_BODY, UI_12_FONT_ID);
       const fui::DeviceContext device = target.deviceContext();
       const fui::InputSnapshot noInput{};
+      interactions.beginPublishCycle();
       fui::Frame<56> frame(target, device, noInput, interactions);
 
       fui::KeyboardProps props;
       const fui::KeyboardLayout& layout = currentLayout();
       props.layout = &layout;
+      props.keyAction = ACTION_KEY;
       props.okLabel = tr(STR_OK_BUTTON);
       props.shiftLabel = tr(STR_KEY_SHIFT);
       props.modeLabel = symbols ? tr(STR_KEY_MODE_ABC) : tr(STR_KEY_MODE_SYMBOLS);
       props.inputMask = static_cast<uint16_t>(fui::InputTouch | fui::InputLongPress);
-      props.selectedIndex = static_cast<int16_t>(selectedLogicalIndex());
+      props.selectedIndex = buttonSelectionVisible_ ? static_cast<int16_t>(selectedLogicalIndex()) : -1;
       props.labelText.font = fui::GfxRendererTarget::FONT_BODY;
       props.altText.font = fui::GfxRendererTarget::FONT_SMALL;
       props.gap = static_cast<int16_t>(metrics.keyboardKeySpacing);
       props.padding = fui::Insets{0, 0, 0, 0};
-      const int hintsTop = renderer.getScreenHeight() - WikiGUI::WIKI_HINTS_HEIGHT;
+      const int hintsTop = renderer.getScreenHeight() - WikiGUI::hintsHeight(mappedInput);
       props.bottomHitOverflow = static_cast<int16_t>(std::max(0, hintsTop - (kbRect.y + kbRect.height)));
 
       fui::keyboard(frame, kbRect, props);
       interactions.publish();
-      interactionsReady = true;
+      interactionsReady.store(true, std::memory_order_release);
   }
 
   const auto labels = mappedInput.mapLabels(tr(STR_BACK), tr(STR_SELECT), tr(STR_DIR_LEFT), tr(STR_DIR_RIGHT));

@@ -1,5 +1,6 @@
 #include "WikiInfoboxViewerActivity.h"
 #include "WikiDecompressor.h"
+#include "components/TouchHeaderBackButton.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 #include <FontCacheManager.h>
@@ -467,8 +468,8 @@ void WikiInfoboxViewerActivity::loadStage(int stageIdx, bool scrollToBottom) {
     const auto& metrics = UITheme::getInstance().getMetrics();
     const int screenW = renderer.getScreenWidth();
     const int screenH = renderer.getScreenHeight();
-    const int headerH = metrics.topPadding + metrics.headerHeight;
-    const int bottomBarH = WikiGUI::WIKI_HINTS_HEIGHT + 14;
+    const int headerH = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
+    const int bottomBarH = mappedInput.hasTouchHardware() ? 10 : (WikiGUI::WIKI_HINTS_HEIGHT + 14);
     const int startX = 16;
     const int renderStartY = headerH + 8;
     const int fontId = WikiFont::getBodyFontId();
@@ -940,8 +941,7 @@ void WikiInfoboxViewerActivity::loop() {
         }
     };
 
-    // Side buttons (Up / Down): scroll up and down the infobox (advancing across stages at boundaries)
-    if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
+    auto scrollDownAction = [&]() {
         if (scrollY_ < maxScrollY_) {
             int pageStep = std::max(40, viewHeight_ - 40);
             scrollY_ = std::min(maxScrollY_, scrollY_ + pageStep);
@@ -956,10 +956,9 @@ void WikiInfoboxViewerActivity::loop() {
             loadStage(currentStage_ + 1, /*scrollToBottom=*/false);
             requestUpdate();
         }
-        return;
-    }
+    };
 
-    if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
+    auto scrollUpAction = [&]() {
         if (scrollY_ > 0) {
             int pageStep = std::max(40, viewHeight_ - 40);
             scrollY_ = std::max(0, scrollY_ - pageStep);
@@ -974,11 +973,9 @@ void WikiInfoboxViewerActivity::loop() {
             loadStage(currentStage_ - 1, /*scrollToBottom=*/true);
             requestUpdate();
         }
-        return;
-    }
+    };
 
-    // Bottom-right double button (Right / Left): select next / previous link
-    if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
+    auto nextLinkAction = [&]() {
         if (!links_.empty()) {
             if (selectedLinkIndex_ == -1) {
                 int found = -1;
@@ -1021,10 +1018,9 @@ void WikiInfoboxViewerActivity::loop() {
             loadStage(currentStage_ + 1, /*scrollToBottom=*/false);
             requestUpdate();
         }
-        return;
-    }
+    };
 
-    if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
+    auto prevLinkAction = [&]() {
         if (!links_.empty()) {
             if (selectedLinkIndex_ == -1) {
                 int found = -1;
@@ -1067,11 +1063,9 @@ void WikiInfoboxViewerActivity::loop() {
             loadStage(currentStage_ - 1, /*scrollToBottom=*/true);
             requestUpdate();
         }
-        return;
-    }
+    };
 
-    // Confirm button: follow the currently selected link
-    if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+    auto activateSelectedLink = [&]() -> bool {
         if (selectedLinkIndex_ >= 0 && selectedLinkIndex_ < static_cast<int>(links_.size())) {
             const auto& lnk = links_[selectedLinkIndex_];
             std::string target = hrefPool_.substr(lnk.hrefOffset, lnk.hrefLen);
@@ -1080,6 +1074,85 @@ void WikiInfoboxViewerActivity::loop() {
             result.data = FilePathResult{std::move(target)};
             setResult(std::move(result));
             finish();
+            return true;
+        }
+        return false;
+    };
+
+#if CROSSINK_APP_CAP_TOUCH
+    if (TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
+        finish();
+        return;
+    }
+
+    int tx = 0;
+    int ty = 0;
+    if (mappedInput.wasScreenTapped(tx, ty)) {
+        const auto& metrics = UITheme::getInstance().getMetrics();
+        const int headerH = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
+        if (ty < headerH) {
+            return;
+        }
+        const int renderStartY = headerH + 8;
+        for (int i = 0; i < static_cast<int>(links_.size()); ++i) {
+            const auto& lnk = links_[i];
+            for (uint16_t ri = 0; ri < lnk.rectCount; ++ri) {
+                const auto& rect = linkRects_[lnk.rectStartIdx + ri];
+                const int ry = renderStartY + rect.y - scrollY_;
+                if (ry < renderStartY || ry + rect.h > renderStartY + viewHeight_) continue;
+                if (tx >= rect.x - 4 && tx <= rect.x + rect.w + 4 &&
+                    ty >= ry - 4 && ty <= ry + rect.h + 4) {
+                    selectedLinkIndex_ = i;
+                    activateSelectedLink();
+                    return;
+                }
+            }
+        }
+        const int midX = renderer.getScreenWidth() / 2;
+        if (tx < midX) {
+            scrollUpAction();
+        } else {
+            scrollDownAction();
+        }
+        return;
+    }
+
+    const auto swipe = mappedInput.wasSwipe();
+    if (swipe == MappedInputManager::SwipeDir::Up || swipe == MappedInputManager::SwipeDir::Left) {
+        scrollDownAction();
+        return;
+    }
+    if (swipe == MappedInputManager::SwipeDir::Down || swipe == MappedInputManager::SwipeDir::Right) {
+        scrollUpAction();
+        return;
+    }
+#endif
+
+    // Side buttons (Up / Down): scroll up and down the infobox (advancing across stages at boundaries)
+    if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
+        scrollDownAction();
+        return;
+    }
+
+    if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
+        scrollUpAction();
+        return;
+    }
+
+    // Bottom-right double button (Right / Left): select next / previous link
+    if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
+        nextLinkAction();
+        return;
+    }
+
+    if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
+        prevLinkAction();
+        return;
+    }
+
+    // Confirm button: follow the currently selected link
+    if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+        if (activateSelectedLink()) {
             return;
         }
     }
@@ -1147,7 +1220,7 @@ void WikiInfoboxViewerActivity::renderLinkHighlightUpdate(int oldLinkIdx, int ne
     const auto& metrics = UITheme::getInstance().getMetrics();
     const int screenW = renderer.getScreenWidth();
     const int screenH = renderer.getScreenHeight();
-    const int headerH = metrics.topPadding + metrics.headerHeight;
+    const int headerH = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
     const int startX = 16;
     const int renderStartY = headerH + 8;
     const int fontId = WikiFont::getBodyFontId();
@@ -1274,8 +1347,8 @@ void WikiInfoboxViewerActivity::render(RenderLock&& lock) {
     const auto& metrics = UITheme::getInstance().getMetrics();
     const int screenW = renderer.getScreenWidth();
     const int screenH = renderer.getScreenHeight();
-    const int headerH = metrics.topPadding + metrics.headerHeight;
-    const int bottomBarH = WikiGUI::WIKI_HINTS_HEIGHT + 14;
+    const int headerH = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
+    const int bottomBarH = mappedInput.hasTouchHardware() ? 10 : (WikiGUI::WIKI_HINTS_HEIGHT + 14);
     const int startX = 16;
     const int renderStartY = headerH + 8;
     const int fontId = WikiFont::getBodyFontId();
@@ -1325,14 +1398,19 @@ void WikiInfoboxViewerActivity::render(RenderLock&& lock) {
     renderer.clearScreen();
 
     // Header
-    Rect headerRect{0, metrics.topPadding, screenW, metrics.headerHeight};
+    const Rect headerRect = TouchHeaderBackButton::headerRect(renderer, mappedInput);
     char headerTitle[32];
     if (currentStage_ > 0 || hasNextStage_) {
         std::snprintf(headerTitle, sizeof(headerTitle), "Infobox (%d)", currentStage_ + 1);
     } else {
         std::snprintf(headerTitle, sizeof(headerTitle), "Infobox");
     }
-    GUI.drawHeader(renderer, headerRect, headerTitle, title_.c_str());
+    if (mappedInput.hasTouchHardware()) {
+        const int subtitleReserve = std::min(screenW / 2, renderer.getTextWidth(SMALL_FONT_ID, title_.c_str()) + 32);
+        TouchHeaderBackButton::draw(renderer, headerRect, headerTitle, false, subtitleReserve, title_.c_str());
+    } else {
+        GUI.drawHeader(renderer, headerRect, headerTitle, title_.c_str());
+    }
 
     // Scroll indicator on right edge
     if (maxScrollY_ > 0) {
@@ -1460,13 +1538,15 @@ void WikiInfoboxViewerActivity::render(RenderLock&& lock) {
     renderedLinkIndex_ = selectedLinkIndex_;
 
     // Bottom Bar Chrome
-    int bottomBarY = screenH - bottomBarH;
-    renderer.fillRect(0, bottomBarY, screenW, bottomBarH, false);
-    renderer.drawLine(0, bottomBarY, screenW - 1, bottomBarY, true);
-    if (!links_.empty()) {
-        WikiGUI::drawDoubleButtonHints(renderer, {"Back", ""}, {"Select link", ""}, {"Prev link", ""}, {"Next link", ""});
-    } else {
-        WikiGUI::drawDoubleButtonHints(renderer, {"Back", ""}, {"", ""}, {"", ""}, {"", ""});
+    if (!mappedInput.hasTouchHardware()) {
+        int bottomBarY = screenH - bottomBarH;
+        renderer.fillRect(0, bottomBarY, screenW, bottomBarH, false);
+        renderer.drawLine(0, bottomBarY, screenW - 1, bottomBarY, true);
+        if (!links_.empty()) {
+            WikiGUI::drawDoubleButtonHints(renderer, {"Back", ""}, {"Select link", ""}, {"Prev link", ""}, {"Next link", ""});
+        } else {
+            WikiGUI::drawDoubleButtonHints(renderer, {"Back", ""}, {"", ""}, {"", ""}, {"", ""});
+        }
     }
 
     renderer.displayBuffer(HalDisplay::FAST_REFRESH);

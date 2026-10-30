@@ -1,3 +1,4 @@
+#include "components/TouchHeaderBackButton.h"
 #include "components/UITheme.h"
 #include "fontIds.h"
 
@@ -541,8 +542,8 @@ void WikiTableViewerActivity::rebuildWindowsAndLayout() {
     const int fontId = WikiFont::getBodyFontId();
     const int lineHeight = renderer.getLineHeight(fontId) + layoutCfg_.lineSpacing;
     const auto& metrics = UITheme::getInstance().getMetrics();
-    const int headerH = metrics.topPadding + metrics.headerHeight;
-    const int bottomBarH = WikiGUI::WIKI_HINTS_HEIGHT + 14;
+    const int headerH = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
+    const int bottomBarH = mappedInput.hasTouchHardware() ? 10 : (WikiGUI::WIKI_HINTS_HEIGHT + 14);
     const int startX = 16;
     const int renderStartY = headerH + 8;
 
@@ -1303,8 +1304,8 @@ void WikiTableViewerActivity::computeLayout() {
     const int lineHeight = renderer.getLineHeight(fontId) + layoutCfg_.lineSpacing;
     const auto& metrics = UITheme::getInstance().getMetrics();
 
-    const int headerH = metrics.topPadding + metrics.headerHeight;
-    const int bottomBarH = WikiGUI::WIKI_HINTS_HEIGHT + 14;
+    const int headerH = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
+    const int bottomBarH = mappedInput.hasTouchHardware() ? 10 : (WikiGUI::WIKI_HINTS_HEIGHT + 14);
     const int startX = 16;
     const int renderStartY = headerH + 8;
 
@@ -1738,7 +1739,7 @@ void WikiTableViewerActivity::updateScrollForFocusedCell() {
 void WikiTableViewerActivity::loop() {
     if (mappedInput.wasReleased(MappedInputManager::Button::Back) || mappedInput.wasBackGesture()) { finish(); return; }
 
-    if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+    auto activateFocusedLink = [&]() -> bool {
         if (focusedRow_ >= 0 && focusedRow_ < static_cast<int>(rows_.size()) &&
             focusedCol_ >= 0 && focusedCol_ < static_cast<int>(rows_[focusedRow_].size())) {
             const std::string& target = rows_[focusedRow_][focusedCol_].linkTarget;
@@ -1748,8 +1749,15 @@ void WikiTableViewerActivity::loop() {
                 result.data = FilePathResult{target};
                 setResult(std::move(result));
                 finish();
-                return;
+                return true;
             }
+        }
+        return false;
+    };
+
+    if (mappedInput.wasPressed(MappedInputManager::Button::Confirm)) {
+        if (activateFocusedLink()) {
+            return;
         }
     }
 
@@ -1757,7 +1765,8 @@ void WikiTableViewerActivity::loop() {
 
     bool moved = false;
     bool sectorScrolled = false;
-    if (mappedInput.wasPressed(MappedInputManager::Button::Down)) {
+
+    auto stepDown = [&]() {
         bool scrolledInsideCell = false;
         if (focusedRow_ >= 0 && focusedRow_ < static_cast<int>(cellLayouts_.size()) &&
             focusedCol_ >= 0 && focusedCol_ < static_cast<int>(cellLayouts_[focusedRow_].size())) {
@@ -1793,8 +1802,9 @@ void WikiTableViewerActivity::loop() {
                 sectorScrolled = true;
             }
         }
-    }
-    if (mappedInput.wasPressed(MappedInputManager::Button::Up)) {
+    };
+
+    auto stepUp = [&]() {
         bool scrolledInsideCell = false;
         if (focusedRow_ >= 0 && focusedRow_ < static_cast<int>(cellLayouts_.size()) &&
             focusedCol_ >= 0 && focusedCol_ < static_cast<int>(cellLayouts_[focusedRow_].size())) {
@@ -1830,8 +1840,9 @@ void WikiTableViewerActivity::loop() {
                 sectorScrolled = true;
             }
         }
-    }
-    if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
+    };
+
+    auto stepLeft = [&]() {
         int prevCol = focusedCol_ - 1;
         while (prevCol > 0 && focusedRow_ >= 0 && focusedRow_ < static_cast<int>(cellLayouts_.size()) &&
                prevCol < static_cast<int>(cellLayouts_[focusedRow_].size()) &&
@@ -1846,8 +1857,9 @@ void WikiTableViewerActivity::loop() {
             scrollX_ = sectorOffsetsX_[currentSecX_];
             sectorScrolled = true;
         }
-    }
-    if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
+    };
+
+    auto stepRight = [&]() {
         int nextCol = focusedCol_ + 1;
         while (focusedRow_ >= 0 && focusedRow_ < static_cast<int>(cellLayouts_.size()) &&
                nextCol < static_cast<int>(cellLayouts_[focusedRow_].size()) &&
@@ -1862,6 +1874,161 @@ void WikiTableViewerActivity::loop() {
             scrollX_ = sectorOffsetsX_[currentSecX_];
             sectorScrolled = true;
         }
+    };
+
+#if CROSSINK_APP_CAP_TOUCH
+    if (mappedInput.hasTouchHardware()) {
+        if (TouchHeaderBackButton::wasTapped(mappedInput, renderer)) {
+            finish();
+            return;
+        }
+        int tx = 0;
+        int ty = 0;
+        if (mappedInput.wasScreenTapped(tx, ty)) {
+            const auto& metrics = UITheme::getInstance().getMetrics();
+            if (ty < metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput)) {
+                return;
+            }
+            for (size_t r = 0; r < rows_.size(); ++r) {
+                for (size_t c = 0; c < rows_[r].size(); ++c) {
+                    int screenX = 0, screenY = 0;
+                    int clipMinX = 0, clipMaxX = 0, clipMinY = 0, clipMaxY = 0;
+                    if (!getCellScreenGeometry(r, c, screenX, screenY, clipMinX, clipMaxX, clipMinY, clipMaxY)) {
+                        continue;
+                    }
+                    const auto& cell = cellLayouts_[r][c];
+                    const int cellW = (!isClade_ && !rows_[r].empty() && rows_[r][0].isFullRowBanner)
+                                          ? (clipMaxX - clipMinX)
+                                          : cell.width;
+                    const int bx = std::max(clipMinX, screenX);
+                    const int by = std::max(clipMinY, screenY);
+                    const int br = std::min(clipMaxX, screenX + cellW);
+                    const int bb = std::min(clipMaxY, screenY + cell.height);
+                    if (tx >= bx && tx < br && ty >= by && ty < bb) {
+                        focusedRow_ = static_cast<int>(r);
+                        focusedCol_ = static_cast<int>(c);
+                        if (activateFocusedLink()) {
+                            return;
+                        }
+                        return;
+                    }
+                }
+            }
+        } else {
+            const int stickyW = (!isClade_ && hasStickyLeftCol_ && !rows_.empty() && rows_[0].size() > 1) ? stickyLeftWidth_ : 0;
+            const size_t minScrollCol = (stickyW > 0) ? 1 : 0;
+            const size_t minScrollRow = (!isClade_ && hasStickyTopRow_) ? static_cast<size_t>(stickyTopRowCount_) : 0;
+            const auto swipe = mappedInput.wasSwipe();
+            if (swipe == MappedInputManager::SwipeDir::Left) {
+                if (currentSecX_ + 1 < numSectorsX_) {
+                    currentSecX_++;
+                    scrollX_ = sectorOffsetsX_[currentSecX_];
+                    if (focusedRow_ >= 0 && focusedRow_ < static_cast<int>(cellLayouts_.size())) {
+                        for (size_t c = minScrollCol; c < cellLayouts_[focusedRow_].size(); ++c) {
+                            const auto& cell = cellLayouts_[focusedRow_][c];
+                            if (cell.width > 0 && (cell.x - stickyW) >= scrollX_) {
+                                focusedCol_ = static_cast<int>(c);
+                                break;
+                            }
+                        }
+                    }
+                    sectorScrolled = true;
+                } else {
+                    stepRight();
+                }
+            } else if (swipe == MappedInputManager::SwipeDir::Right) {
+                if (currentSecX_ > 0) {
+                    currentSecX_--;
+                    scrollX_ = sectorOffsetsX_[currentSecX_];
+                    if (focusedRow_ >= 0 && focusedRow_ < static_cast<int>(cellLayouts_.size())) {
+                        for (size_t c = minScrollCol; c < cellLayouts_[focusedRow_].size(); ++c) {
+                            const auto& cell = cellLayouts_[focusedRow_][c];
+                            if (cell.width > 0 && (cell.x - stickyW) >= scrollX_) {
+                                focusedCol_ = static_cast<int>(c);
+                                break;
+                            }
+                        }
+                    }
+                    sectorScrolled = true;
+                } else {
+                    stepLeft();
+                }
+            } else if (swipe == MappedInputManager::SwipeDir::Up) {
+                if (currentSecY_ + 1 < numSectorsY_) {
+                    currentSecY_++;
+                    scrollY_ = sectorOffsetsY_[currentSecY_];
+                    for (size_t r = minScrollRow; r < cellLayouts_.size(); ++r) {
+                        if (focusedCol_ >= 0 && focusedCol_ < static_cast<int>(cellLayouts_[r].size())) {
+                            const auto& cell = cellLayouts_[r][focusedCol_];
+                            if (cell.height > 0 && (cell.y - stickyH) >= scrollY_) {
+                                focusedRow_ = static_cast<int>(r);
+                                break;
+                            }
+                        }
+                    }
+                    sectorScrolled = true;
+                } else if (currentWindowIdx_ + 1 < windows_.size()) {
+                    int savedCol = focusedCol_;
+                    int savedSecX = currentSecX_;
+                    loadRowWindow(currentWindowIdx_ + 1);
+                    focusedRow_ = std::min(stickyTopRowCount_, std::max(0, static_cast<int>(rows_.size()) - 1));
+                    focusedCol_ = std::clamp(savedCol, 0, std::max(0, static_cast<int>(rows_[focusedRow_].size()) - 1));
+                    currentSecX_ = std::clamp(savedSecX, 0, std::max(0, numSectorsX_ - 1));
+                    currentSecY_ = 0;
+                    scrollX_ = (currentSecX_ < static_cast<int>(sectorOffsetsX_.size())) ? sectorOffsetsX_[currentSecX_] : 0;
+                    scrollY_ = (currentSecY_ < static_cast<int>(sectorOffsetsY_.size())) ? sectorOffsetsY_[currentSecY_] : 0;
+                    pageRedrawNeeded_ = true;
+                    sectorScrolled = true;
+                } else {
+                    stepDown();
+                }
+            } else if (swipe == MappedInputManager::SwipeDir::Down) {
+                if (currentSecY_ > 0) {
+                    currentSecY_--;
+                    scrollY_ = sectorOffsetsY_[currentSecY_];
+                    for (size_t r = minScrollRow; r < cellLayouts_.size(); ++r) {
+                        if (focusedCol_ >= 0 && focusedCol_ < static_cast<int>(cellLayouts_[r].size())) {
+                            const auto& cell = cellLayouts_[r][focusedCol_];
+                            if (cell.height > 0 && (cell.y - stickyH) >= scrollY_) {
+                                focusedRow_ = static_cast<int>(r);
+                                break;
+                            }
+                        }
+                    }
+                    sectorScrolled = true;
+                } else if (currentWindowIdx_ > 0) {
+                    int savedCol = focusedCol_;
+                    int savedSecX = currentSecX_;
+                    loadRowWindow(currentWindowIdx_ - 1);
+                    focusedRow_ = std::max(0, static_cast<int>(rows_.size()) - 1);
+                    focusedCol_ = std::clamp(savedCol, 0, std::max(0, static_cast<int>(rows_[focusedRow_].size()) - 1));
+                    currentSecX_ = std::clamp(savedSecX, 0, std::max(0, numSectorsX_ - 1));
+                    currentSecY_ = std::max(0, numSectorsY_ - 1);
+                    scrollX_ = (currentSecX_ < static_cast<int>(sectorOffsetsX_.size())) ? sectorOffsetsX_[currentSecX_] : 0;
+                    scrollY_ = (currentSecY_ < static_cast<int>(sectorOffsetsY_.size())) ? sectorOffsetsY_[currentSecY_] : 0;
+                    pageRedrawNeeded_ = true;
+                    sectorScrolled = true;
+                } else {
+                    stepUp();
+                }
+            }
+        }
+    }
+#endif
+
+    if (mappedInput.wasPressed(MappedInputManager::Button::Down) ||
+        mappedInput.wasPressed(MappedInputManager::Button::PageForward)) {
+        stepDown();
+    }
+    if (mappedInput.wasPressed(MappedInputManager::Button::Up) ||
+        mappedInput.wasPressed(MappedInputManager::Button::PageBack)) {
+        stepUp();
+    }
+    if (mappedInput.wasPressed(MappedInputManager::Button::Left)) {
+        stepLeft();
+    }
+    if (mappedInput.wasPressed(MappedInputManager::Button::Right)) {
+        stepRight();
     }
 
     if (moved) {
@@ -1940,7 +2107,7 @@ bool WikiTableViewerActivity::getCellScreenGeometry(size_t r, size_t c, int& scr
                                                     int& clipMinX, int& clipMaxX, int& clipMinY, int& clipMaxY) const {
     if (r >= cellLayouts_.size() || c >= cellLayouts_[r].size()) return false;
     const auto& metrics = UITheme::getInstance().getMetrics();
-    const int headerH = metrics.topPadding + metrics.headerHeight;
+    const int headerH = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
     const int startX = 16;
     const int renderStartY = headerH + 8;
     const auto& cell = cellLayouts_[r][c];
@@ -2019,7 +2186,7 @@ void WikiTableViewerActivity::renderPendingImages() {
     const auto& metrics = UITheme::getInstance().getMetrics();
     const int screenW = renderer.getScreenWidth();
     const int screenH = renderer.getScreenHeight();
-    const int headerH = metrics.topPadding + metrics.headerHeight;
+    const int headerH = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
     const int startX = 16;
     const int renderStartY = headerH + 8;
 
@@ -2044,7 +2211,8 @@ void WikiTableViewerActivity::renderPendingImages() {
         if (br > bx && bb > by) {
             if (!isClade_) {
                 renderer.drawRect(bx, by, br - bx, bb - by, true);
-                if (static_cast<int>(img.row) == focusedRow_ && static_cast<int>(img.col) == focusedCol_) {
+                if (!mappedInput.hasTouchHardware() &&
+                    static_cast<int>(img.row) == focusedRow_ && static_cast<int>(img.col) == focusedCol_) {
                     int fx = std::max<int>(bx + 1, img.screenX + 1);
                     int fy = std::max<int>(by + 1, img.screenY + 1);
                     int fr = std::min<int>(br - 1, img.screenX + img.cellW - 2);
@@ -2054,7 +2222,8 @@ void WikiTableViewerActivity::renderPendingImages() {
                         renderer.drawRect(fx + 1, fy + 1, fr - fx - 1, fb - fy - 1, true);
                     }
                 }
-            } else if (static_cast<int>(img.row) == focusedRow_ && static_cast<int>(img.col) == focusedCol_) {
+            } else if (!mappedInput.hasTouchHardware() &&
+                       static_cast<int>(img.row) == focusedRow_ && static_cast<int>(img.col) == focusedCol_) {
                 int fx = std::max<int>(startX, img.screenX + 1);
                 int fy = std::max<int>(renderStartY, img.screenY + 1);
                 int fr = std::min<int>(startX + viewWidth_, img.screenX + img.cellW - 1);
@@ -2102,7 +2271,7 @@ void WikiTableViewerActivity::renderFocusUpdate(int oldRow, int oldCol, int newR
     const auto& metrics = UITheme::getInstance().getMetrics();
     const int screenW = renderer.getScreenWidth();
     const int screenH = renderer.getScreenHeight();
-    const int headerH = metrics.topPadding + metrics.headerHeight;
+    const int headerH = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
     const int startX = 16;
     const int renderStartY = headerH + 8;
     const int fontId = WikiFont::getBodyFontId();
@@ -2251,6 +2420,13 @@ void WikiTableViewerActivity::renderFocusUpdate(int oldRow, int oldCol, int newR
         }
     }
 
+    const bool oldHasLink = (oldRow >= 0 && oldRow < static_cast<int>(rows_.size()) &&
+                             oldCol >= 0 && oldCol < static_cast<int>(rows_[oldRow].size()) &&
+                             !rows_[oldRow][oldCol].linkTarget.empty());
+    const bool newHasLink = (newRow >= 0 && newRow < static_cast<int>(rows_.size()) &&
+                             newCol >= 0 && newCol < static_cast<int>(rows_[newRow].size()) &&
+                             !rows_[newRow][newCol].linkTarget.empty());
+
     renderedFocusedRow_ = newRow;
     renderedFocusedCol_ = newCol;
 
@@ -2263,17 +2439,29 @@ void WikiTableViewerActivity::renderFocusUpdate(int oldRow, int oldCol, int newR
             renderer.displayWindow(wx, wy, wxEnd - wx, wyEnd - wy);
         }
     }
+
+    if (!mappedInput.hasTouchHardware() && oldHasLink != newHasLink) {
+        const int bottomBarH = WikiGUI::WIKI_HINTS_HEIGHT + 14;
+        const int bottomBarY = screenH - bottomBarH;
+        renderer.fillRect(0, bottomBarY, screenW, bottomBarH, false);
+        renderer.drawLine(0, bottomBarY, screenW - 1, bottomBarY, true);
+        WikiGUI::drawDoubleButtonHints(renderer, {"Back", ""}, {newHasLink ? "Select link" : "", ""},
+                                       {"Up/Down", ""}, {"Left/Right", ""});
+        renderer.displayWindow(0, bottomBarY, screenW, bottomBarH);
+    }
 }
 
 void WikiTableViewerActivity::render(RenderLock&& lock) {
     if (!pageRedrawNeeded_ && scrollX_ == renderedScrollX_ && scrollY_ == renderedScrollY_) {
-        if (focusedRow_ != renderedFocusedRow_ || focusedCol_ != renderedFocusedCol_) {
+        if (!mappedInput.hasTouchHardware() && (focusedRow_ != renderedFocusedRow_ || focusedCol_ != renderedFocusedCol_)) {
             renderFocusUpdate(renderedFocusedRow_, renderedFocusedCol_, focusedRow_, focusedCol_);
             if (pendingImageRender_ && imageStage2Triggered_) {
                 renderPendingImages();
             }
             return;
         }
+        renderedFocusedRow_ = focusedRow_;
+        renderedFocusedCol_ = focusedCol_;
         if (pendingImageRender_ && imageStage2Triggered_) {
             renderPendingImages();
             return;
@@ -2289,8 +2477,8 @@ void WikiTableViewerActivity::render(RenderLock&& lock) {
     const auto& metrics = UITheme::getInstance().getMetrics();
     const int screenW = renderer.getScreenWidth();
     const int screenH = renderer.getScreenHeight();
-    const int headerH = metrics.topPadding + metrics.headerHeight;
-    const int bottomBarH = WikiGUI::WIKI_HINTS_HEIGHT + 14;
+    const int headerH = metrics.topPadding + TouchHeaderBackButton::height(metrics, mappedInput);
+    const int bottomBarH = mappedInput.hasTouchHardware() ? 10 : (WikiGUI::WIKI_HINTS_HEIGHT + 14);
     const int startX = 16;
     const int renderStartY = headerH + 8;
     const int fontId = WikiFont::getBodyFontId();
@@ -2302,9 +2490,14 @@ void WikiTableViewerActivity::render(RenderLock&& lock) {
                           : renderer.getTextAdvanceX(fontId, s.c_str(), isBold ? EpdFontFamily::BOLD : EpdFontFamily::REGULAR);
     };
 
-    Rect headerRect{0, metrics.topPadding, screenW, metrics.headerHeight};
+    const Rect headerRect = TouchHeaderBackButton::headerRect(renderer, mappedInput);
     const char* headerType = isClade_ ? "Cladogram" : "Table Viewer";
-    GUI.drawHeader(renderer, headerRect, headerType, title_.c_str());
+    if (mappedInput.hasTouchHardware()) {
+        const int subtitleReserve = std::min(screenW / 2, renderer.getTextWidth(SMALL_FONT_ID, title_.c_str()) + 32);
+        TouchHeaderBackButton::draw(renderer, headerRect, headerType, false, subtitleReserve, title_.c_str());
+    } else {
+        GUI.drawHeader(renderer, headerRect, headerType, title_.c_str());
+    }
 
     // Draw Minimap: Fixed-size 24x14 viewport thumbnail centered in header
     const int globalTotalSecY = getNumSectorsY();
@@ -2313,7 +2506,9 @@ void WikiTableViewerActivity::render(RenderLock&& lock) {
         const int frameW = 24;
         const int frameH = 14;
         int mapX = (screenW - frameW) / 2;
-        int mapY = metrics.topPadding + (metrics.headerHeight - frameH) / 2;
+        int mapY = mappedInput.hasTouchHardware()
+                       ? (headerRect.y + 4)
+                       : (metrics.topPadding + (metrics.headerHeight - frameH) / 2);
         if (mapY < 0) mapY = 0;
 
         renderer.drawRect(mapX, mapY, frameW, frameH, true);
@@ -2378,7 +2573,8 @@ void WikiTableViewerActivity::render(RenderLock&& lock) {
                 if (screenX + cell.width <= startX || screenX >= startX + viewWidth_) continue;
                 if (screenY + cell.height <= renderStartY || screenY >= cladeClipMaxY) continue;
 
-                if (static_cast<int>(r) == focusedRow_ && static_cast<int>(c) == focusedCol_) {
+                if (!mappedInput.hasTouchHardware() &&
+                    static_cast<int>(r) == focusedRow_ && static_cast<int>(c) == focusedCol_) {
                     int fx = std::max(startX, screenX + 1);
                     int fy = std::max(renderStartY, screenY + 1);
                     int fr = std::min(startX + viewWidth_, screenX + cell.width - 1);
@@ -2530,7 +2726,8 @@ void WikiTableViewerActivity::render(RenderLock&& lock) {
                 renderer.drawLine(bx + 1, by, br - 2, by, false);
             }
 
-            if (static_cast<int>(r) == focusedRow_ && static_cast<int>(c) == focusedCol_) {
+            if (!mappedInput.hasTouchHardware() &&
+                static_cast<int>(r) == focusedRow_ && static_cast<int>(c) == focusedCol_) {
                 int fx = std::max(bx + 1, screenX + 1);
                 int fy = std::max(by + 1, screenY + 1);
                 int fr = std::min(br - 1, screenX + cellW - 2);
@@ -2670,13 +2867,16 @@ void WikiTableViewerActivity::render(RenderLock&& lock) {
         renderer.fillRect(startX + stickyW + effW, renderStartY, screenW - (startX + stickyW + effW), viewHeight_, false);
     }
 
-    int bottomBarY = screenH - bottomBarH;
-    renderer.fillRect(0, bottomBarY, screenW, bottomBarH, false);
-    renderer.drawLine(0, bottomBarY, screenW - 1, bottomBarY, true);
-    bool focusedHasLink = (focusedRow_ >= 0 && focusedRow_ < static_cast<int>(rows_.size()) &&
-                           focusedCol_ >= 0 && focusedCol_ < static_cast<int>(rows_[focusedRow_].size()) &&
-                           !rows_[focusedRow_][focusedCol_].linkTarget.empty());
-    WikiGUI::drawDoubleButtonHints(renderer, {"Back", ""}, {focusedHasLink ? "Select link" : "", ""}, {"Up/Down", ""}, {"Left/Right", ""});
+    if (!mappedInput.hasTouchHardware()) {
+        int bottomBarY = screenH - bottomBarH;
+        renderer.fillRect(0, bottomBarY, screenW, bottomBarH, false);
+        renderer.drawLine(0, bottomBarY, screenW - 1, bottomBarY, true);
+        bool focusedHasLink = (focusedRow_ >= 0 && focusedRow_ < static_cast<int>(rows_.size()) &&
+                               focusedCol_ >= 0 && focusedCol_ < static_cast<int>(rows_[focusedRow_].size()) &&
+                               !rows_[focusedRow_][focusedCol_].linkTarget.empty());
+        WikiGUI::drawDoubleButtonHints(renderer, {"Back", ""}, {focusedHasLink ? "Select link" : "", ""},
+                                       {"Up/Down", ""}, {"Left/Right", ""});
+    }
 
     pageRedrawNeeded_ = false;
     renderedScrollX_ = scrollX_;
